@@ -1,0 +1,3 @@
+portfolio_code,ema_sensitivity,amplification,num_portfolios,frac_shares,risk_tolerance,risk_type,remove_amplification_cap,tickers_1,weight_1,tickers_2,weight_2,tickers_3,weight_3
+2,2,1.0,2,yes,10,stock,true,"IBM, SAP, QTUM, ASML, ORCL, MU, AVGO, DELL, TSM, ARM, SE, HWM, CRWD, NVDA, GEV, SMCI, STX, PLTR, VST, CEG, MRVL, PH, GE, INTC, CDNS, NOW, GLW, VRT, TMUS, AAPL, META, GOOG",60.00,"SPY, QQQ, GLD, SLV",40.00
+4,2,1.0,3,yes,10,stock,true,"IBM, SAP, QTUM, ASML, ORCL, MU, AVGO, DELL, TSM, SE, HWM, CRWD, NVDA, GEV, PLTR, VST, CEG, MRVL, PH, GE, CDNS, GLW, VRT, AAPL, META, GOOG, MSFT, HOOD, APP, RDDT, MSTR, COIN, CCJ, IONQ, AMD",65.00,"SPY, QQQ, OEF",20.00,"GLD, SLV",15.00

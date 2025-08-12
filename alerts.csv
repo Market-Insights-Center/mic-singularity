@@ -1,0 +1,3 @@
+ticker,metric,operator,value,sensitivity
+PLTR,price,>=,200.0,
+PLTR,invest,<=,75.0,2
