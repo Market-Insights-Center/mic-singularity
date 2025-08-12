@@ -157,7 +157,7 @@ try:
 
 except (configparser.Error, pytz.exceptions.UnknownTimeZoneError) as e:
     print(f"❌ Error reading configuration file: {e}")
-    GEMINI_API_KEY = "AIzaSyDYpuf4NC1SET9Z5_hQqbJ9tzpxXOPk4k0"
+    GEMINI_API_KEY = "..."
     EST_TIMEZONE = pytz.timezone('US/Eastern')
     MARKET_HEDGING_TICKERS = ['SPY', 'DIA', 'QQQ']
     RESOURCE_HEDGING_TICKERS = ['GLD', 'SLV']
