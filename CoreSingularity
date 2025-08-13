@@ -37,6 +37,7 @@ from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 import configparser
 from scipy.stats import norm
+from urllib.parse import quote_plus
 
 try:
     from pypfopt import EfficientFrontier
@@ -2611,6 +2612,12 @@ def display_commands():
     command_lines.append("  CLI Usage:")
     command_lines.append("    /optimize AAPL GOOG JPM XOM     (For a specific list of tickers)")
     command_lines.append("    /optimize P-4                   (For a saved custom portfolio code)")
+
+    command_lines.append("\n/sentiment - Perform AI-powered sentiment analysis on a stock.")
+    command_lines.append("  Description: Scrapes recent news headlines and social media posts, then uses the Gemini AI")
+    command_lines.append("               to generate a sentiment score (-1.0 to 1.0), a summary, and key positive/negative keywords.")
+    command_lines.append("  CLI Usage:")
+    command_lines.append("    /sentiment NVDA               (Runs sentiment analysis for NVIDIA)")
 
     command_lines.append("\n/fundamentals - Get a fundamental score for a single ticker.")
     command_lines.append("  Description: Fetches P/E, Revenue Growth, Debt-to-Equity, and Profit Margin to calculate a score out of 100.")
@@ -9203,6 +9210,192 @@ async def recommend_short_strangle(ticker: str, exp_date: str, opt_chain, curren
         print(f"-> Failed to generate short strangle recommendation: {e}")
         traceback.print_exc()
 
+async def scrape_finviz_headlines(ticker: str) -> list[str]:
+    """Scrapes news headlines for a given ticker from Finviz."""
+    headlines = []
+    try:
+        url = f"https://finviz.com/quote.ashx?t={ticker}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        news_table = soup.find(id='news-table')
+        
+        if news_table:
+            for row in news_table.find_all('tr'):
+                title_element = row.find('a', class_='news-link-left')
+                if title_element:
+                    headlines.append(title_element.get_text(strip=True))
+    except requests.exceptions.HTTPError as http_err:
+        print(f"   -> Finviz HTTP error for {ticker}: {http_err}")
+    except Exception as e:
+        print(f"   -> An error occurred while scraping Finviz for {ticker}: {e}")
+    return headlines
+
+async def scrape_reddit_combined(ticker: str, company_name: str) -> list[str]:
+    """
+    Combines two scraping methods and searches for both the ticker and company name.
+    """
+    post_titles = set()
+    headers = {'User-Agent': 'Mozilla/5.0 SingularityBot/1.0'}
+    
+    # Create a search query for Reddit that looks for EITHER the ticker OR the full company name
+    # Example: '"NVDA" OR "Nvidia"'
+    search_query = f'"{ticker}" OR "{company_name}"'
+    encoded_query = quote_plus(search_query) # URL-encode the query
+
+    print("   -> Searching Reddit communities (Combined Method)...")
+
+    # Method 1: Scrape 'hot' posts from the ticker-specific subreddit (this remains ticker-based)
+    try:
+        specific_url = f"https://old.reddit.com/r/{ticker.lower()}/hot/"
+        response = await asyncio.to_thread(requests.get, specific_url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for i, post in enumerate(soup.find_all('a', class_='title may-blank')):
+                if i >= 10: break
+                post_titles.add(post.get_text(strip=True))
+    except Exception as e:
+        print(f"   -> Info: Could not scrape 'r/{ticker.lower()}' directly. {e}")
+
+    # Method 2: Search for the combined query in general subreddits
+    subreddits_to_search = ['wallstreetbets', 'stocks', 'investing']
+    for subreddit in subreddits_to_search:
+        try:
+            search_url = f"https://old.reddit.com/r/{subreddit}/search/?q={encoded_query}&restrict_sr=1&sort=hot&t=week"
+            response = await asyncio.to_thread(requests.get, search_url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                for i, post in enumerate(soup.find_all('a', class_='search-title may-blank')):
+                    if i >= 5: break
+                    post_titles.add(post.get_text(strip=True))
+        except Exception as e:
+            print(f"   -> Warning: An error occurred while searching 'r/{subreddit}': {e}")
+            
+    print(f"   -> Found {len(post_titles)} unique Reddit post titles for {ticker}/{company_name}.")
+    return list(post_titles)
+
+async def get_company_name(ticker: str) -> str:
+    """Fetches the long name of a company from its ticker using yfinance."""
+    try:
+        stock_info = await asyncio.to_thread(lambda: yf.Ticker(ticker).info)
+        # Prioritize longName, but fall back to shortName or the ticker itself
+        name = stock_info.get('longName') or stock_info.get('shortName') or ticker
+        return name
+    except Exception:
+        # If yfinance fails, just use the ticker as the name
+        return ticker
+    
+async def handle_sentiment_command(args: list, ai_params: dict = None, is_called_by_ai: bool = False):
+    """
+    Performs AI-driven sentiment analysis on a stock by scraping news and social media.
+    """
+    global gemini_model
+    if not gemini_model:
+        return "AI model is not configured. Cannot perform sentiment analysis."
+
+    ticker = None
+    if is_called_by_ai and ai_params:
+        ticker = ai_params.get("ticker")
+    elif args:
+        ticker = args[0]
+    
+    if not ticker:
+        message = "Please provide a stock ticker. Usage: /sentiment <TICKER>"
+        if not is_called_by_ai: print(message)
+        return {"error": message} if is_called_by_ai else None
+
+    ticker = ticker.upper()
+    if not is_called_by_ai:
+        print(f"\n--- AI Sentiment Analysis for {ticker} ---")
+        print("-> Scraping recent news and social media mentions...")
+
+    # --- Step 1: Get Company Name and Scrape Data ---
+    company_name = await get_company_name(ticker) # ADD THIS LINE
+    
+    finviz_task = scrape_finviz_headlines(ticker)
+    # Pass BOTH ticker and company_name to the Reddit scraper
+    reddit_task = scrape_reddit_combined(ticker, company_name) # UPDATE THIS LINE
+    headlines, reddit_titles = await asyncio.gather(finviz_task, reddit_task)
+    
+    combined_text = "\n".join(headlines) + "\n" + "\n".join(reddit_titles)
+    
+    if not combined_text.strip():
+        message = f"-> Could not find any recent text for {ticker}. Unable to perform analysis."
+        if not is_called_by_ai: print(message)
+        return {"error": message} if is_called_by_ai else None
+        
+    print(f"-> Data gathered for '{company_name}'. Sending to AI for analysis...") # Updated print
+
+    # --- Step 2: Prompt Gemini for JSON output ---
+    # The prompt generation and AI call remain exactly the same.
+    prompt = f"""
+    Analyze the sentiment of the following combined text from news headlines and social media posts regarding the stock ticker {ticker} ({company_name}). 
+    Based *only* on the text provided, return a JSON object with the following exact structure:
+    {{
+      "sentiment_score": float,
+      "summary": "string",
+      "positive_keywords": ["string"],
+      "negative_keywords": ["string"]
+    }}
+
+    - 'sentiment_score' must be a single float between -1.0 (very bearish) and 1.0 (very bullish).
+    - 'summary' must be a concise 2-3 sentence summary of the overall topics and mood.
+    - 'positive_keywords' must be a list of up to 5 key bullish words or short phrases.
+    - 'negative_keywords' must be a list of up to 5 key bearish words or short phrases.
+
+    Here is the text to analyze:
+    ---
+    {combined_text[:4000]}
+    ---
+    """
+    
+    try:
+        response = await asyncio.to_thread(
+            gemini_model.generate_content,
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.2,
+                response_mime_type="application/json"
+            )
+        )
+        
+        # --- Step 3: Parse and Display Results (This part remains the same) ---
+        analysis_result = json.loads(response.text)
+        
+        score = analysis_result.get("sentiment_score", 0.0)
+        summary = analysis_result.get("summary", "No summary provided.")
+        pos_keys = analysis_result.get("positive_keywords", [])
+        neg_keys = analysis_result.get("negative_keywords", [])
+
+        if not is_called_by_ai:
+            print("\n--- Sentiment Analysis Results ---")
+            score_bar = "🐻" * int(max(0, ((-score + 1)/2) * 10)) + " | " + "🐂" * int(max(0, ((score + 1)/2) * 10))
+            print(f"  Sentiment Score: {score:.2f} [{score_bar}]")
+            print("\n  AI Summary:")
+            print(f"    {summary}")
+            print("\n  Positive Keywords:", ", ".join(pos_keys) if pos_keys else "None identified")
+            print("  Negative Keywords:", ", ".join(neg_keys) if neg_keys else "None identified")
+            print("---------------------------------")
+
+        return {
+            "ticker": ticker,
+            "sentiment_score": score,
+            "summary": summary,
+            "positive_keywords": pos_keys,
+            "negative_keywords": neg_keys
+        }
+
+    except json.JSONDecodeError:
+        message = "-> AI returned a response that was not valid JSON. Cannot parse sentiment."
+        if not is_called_by_ai: print(message)
+        return {"error": message, "raw_response": response.text if 'response' in locals() else "N/A"}
+    except Exception as e:
+        message = f"-> An unexpected error occurred during AI analysis: {e}"
+        if not is_called_by_ai: print(message)
+        return {"error": message}
+    
 # --- AI Tool Definitions (FunctionDeclarations) ---
 briefing_tool = FunctionDeclaration(
     name="handle_briefing_command",
@@ -9376,6 +9569,18 @@ manage_user_favorites_tool_declaration = FunctionDeclaration(
     }, "required": ["action"]}
 )
 
+sentiment_analysis_tool = FunctionDeclaration(
+    name="handle_sentiment_command",
+    description="Performs AI-driven sentiment analysis for a single stock ticker. It scrapes recent news and social media, then uses an AI model to generate a sentiment score (-1.0 to 1.0), a summary of the discussion, and key positive/negative keywords.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "ticker": {"type": "string", "description": "The stock ticker symbol to analyze, e.g., 'NVDA'."}
+        },
+        "required": ["ticker"]
+    }
+)
+
 # --- AVAILABLE_PYTHON_FUNCTIONS Dictionary ---
 # This dictionary maps the AI tool names to your actual Python functions.
 # Ensure all functions listed in FunctionDeclarations are present here.
@@ -9399,6 +9604,7 @@ AVAILABLE_PYTHON_FUNCTIONS: dict[str, callable] = {
     "manage_user_favorites_tool": manage_user_favorites_tool,
     "handle_fundamentals_command": handle_fundamentals_command,
     "handle_report_generation": handle_report_generation,
+    "handle_sentiment_command": handle_sentiment_command,
 }
 
 async def handle_ai_prompt(user_new_message: str, is_new_session: bool = False, original_session_request: Optional[str] = None):
@@ -9431,6 +9637,7 @@ async def handle_ai_prompt(user_new_message: str, is_new_session: bool = False, 
             get_user_preferences_tool,
             manage_user_favorites_tool_declaration,
             handle_report_generation,
+            sentiment_analysis_tool,
         ])
     except NameError as e:
         print(f"Error: A FunctionDeclaration object for a tool is not defined globally: {e}")
@@ -9818,6 +10025,7 @@ async def main_singularity():
             elif command == "/heatmap": await handle_heatmap_command(args, is_called_by_ai=False)
             elif command == "/fundamentals": await handle_fundamentals_command(args, ai_params=None, is_called_by_ai=False)
             elif command == "/optimize": await handle_optimize_command(args, is_called_by_ai=False)
+            elif command == "/sentiment": await handle_sentiment_command(args, ai_params=None, is_called_by_ai=False)
             elif command == "/favorites": await handle_favorites_command(args, is_called_by_ai=False)
             elif command == "/help": display_commands()
             elif command == "/exit":
