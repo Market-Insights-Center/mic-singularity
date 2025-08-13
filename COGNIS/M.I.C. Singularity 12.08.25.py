@@ -36,15 +36,7 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 import configparser
-
-# --- FIX: Corrected the library name to 'py_vollib_vectorized' and updated import structure ---
-try:
-    from py_vollib_vectorized import price_dataframe
-    print("✔ 'py_vollib_vectorized' loaded successfully.")
-except ImportError:
-    print("⚠️ Warning: 'py_vollib_vectorized' is not installed. The /options command will not be available.")
-    print("Please run: pip install py-vollib-vectorized")
-    price_dataframe = None
+from scipy.stats import norm
 
 try:
     from pypfopt import EfficientFrontier
@@ -157,7 +149,7 @@ try:
 
 except (configparser.Error, pytz.exceptions.UnknownTimeZoneError) as e:
     print(f"❌ Error reading configuration file: {e}")
-    GEMINI_API_KEY = "..."
+    GEMINI_API_KEY = "AIzaSyDYpuf4NC1SET9Z5_hQqbJ9tzpxXOPk4k0"
     EST_TIMEZONE = pytz.timezone('US/Eastern')
     MARKET_HEDGING_TICKERS = ['SPY', 'DIA', 'QQQ']
     RESOURCE_HEDGING_TICKERS = ['GLD', 'SLV']
@@ -8754,11 +8746,68 @@ async def alert_worker():
                     active_alerts.pop(index)
 
 # --- Options Analysis Main Handler ---
+def calculate_greeks_numpy(df, flag_col='Flag', underlying_price_col='S', strike_col='K', annualized_tte_col='t', riskfree_rate_col='r', sigma_col='sigma', dividend_col='q'):
+    """
+    A NumPy-based replacement for the price_dataframe function from py_vollib_vectorized.
+    Calculates Black-Scholes-Merton option prices and greeks in a vectorized manner.
+    """
+    # Extract columns as numpy arrays
+    S = df[underlying_price_col].values
+    K = df[strike_col].values
+    t = df[annualized_tte_col].values
+    r = df[riskfree_rate_col].values
+    sigma = df[sigma_col].values
+    q = df[dividend_col].values
+    
+    # Ensure t > 0 to avoid division by zero
+    t = np.maximum(t, 1e-9)
+
+    # Calculate d1 and d2
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+    d2 = d1 - sigma * np.sqrt(t)
+
+    # Create a results DataFrame
+    results = pd.DataFrame(index=df.index)
+
+    # Based on the flag ('c' for call, 'p' for put)
+    call_flags = df[flag_col] == 'c'
+    put_flags = ~call_flags
+
+    # Calculate Price
+    results['Price'] = 0.0
+    results.loc[call_flags, 'Price'] = (S[call_flags] * np.exp(-q[call_flags] * t[call_flags]) * norm.cdf(d1[call_flags])) - (K[call_flags] * np.exp(-r[call_flags] * t[call_flags]) * norm.cdf(d2[call_flags]))
+    results.loc[put_flags, 'Price'] = (K[put_flags] * np.exp(-r[put_flags] * t[put_flags]) * norm.cdf(-d2[put_flags])) - (S[put_flags] * np.exp(-q[put_flags] * t[put_flags]) * norm.cdf(-d1[put_flags]))
+
+    # Calculate Greeks
+    results['delta'] = 0.0
+    results.loc[call_flags, 'delta'] = np.exp(-q[call_flags] * t[call_flags]) * norm.cdf(d1[call_flags])
+    results.loc[put_flags, 'delta'] = -np.exp(-q[put_flags] * t[put_flags]) * norm.cdf(-d1[put_flags])
+
+    results['gamma'] = np.exp(-q * t) * norm.pdf(d1) / (S * sigma * np.sqrt(t))
+    
+    results['vega'] = S * np.exp(-q * t) * norm.pdf(d1) * np.sqrt(t)
+    
+    results['theta'] = 0.0
+    theta_term1 = - (S * np.exp(-q * t) * norm.pdf(d1) * sigma) / (2 * np.sqrt(t))
+    call_theta_term2 = -r * K * np.exp(-r * t) * norm.cdf(d2)
+    call_theta_term3 = q * S * np.exp(-q * t) * norm.cdf(d1)
+    results.loc[call_flags, 'theta'] = theta_term1[call_flags] + call_theta_term2[call_flags] + call_theta_term3[call_flags]
+
+    put_theta_term2 = -r * K * np.exp(-r * t) * norm.cdf(-d2)
+    put_theta_term3 = q * S * np.exp(-q * t) * norm.cdf(-d1)
+    results.loc[put_flags, 'theta'] = theta_term1[put_flags] - put_theta_term2[put_flags] - put_theta_term3[put_flags]
+
+    results['rho'] = 0.0
+    results.loc[call_flags, 'rho'] = K[call_flags] * t[call_flags] * np.exp(-r[call_flags] * t[call_flags]) * norm.cdf(d2[call_flags])
+    results.loc[put_flags, 'rho'] = -K[put_flags] * t[put_flags] * np.exp(-r[put_flags] * t[put_flags]) * norm.cdf(-d2[put_flags])
+
+    return results
+
 async def handle_options_command(args: List[str], ai_params: Optional[Dict]=None, is_called_by_ai: bool = False):
     """
     Main handler for the advanced /options command. Provides a menu for different types of analysis.
     """
-    if not price_dataframe:
+    if not calculate_greeks_numpy:
         print("❌ Error: The 'py_vollib' library is not loaded. Cannot perform options analysis.")
         return
 
@@ -8920,9 +8969,9 @@ async def plot_option_visualizations(ticker: str, exp_date: str, strike: float, 
             'Flag': [details['flag']]
         })
 
-        current_greeks = price_dataframe(
+        current_greeks = calculate_greeks_numpy(
             current_df, flag_col='Flag', underlying_price_col='S', strike_col='K', annualized_tte_col='t',
-            riskfree_rate_col='r', sigma_col='sigma', dividend_col='q', model='black_scholes_merton'
+            riskfree_rate_col='r', sigma_col='sigma', dividend_col='q'
         )
 
         current_delta = current_greeks['delta'].iloc[0]
@@ -8965,9 +9014,9 @@ async def plot_option_visualizations(ticker: str, exp_date: str, strike: float, 
             'Flag': 'c' if option_type == 'call' else 'p'
         })
 
-        greeks_df = price_dataframe(
+        greeks_df = calculate_greeks_numpy(
             df, flag_col='Flag', underlying_price_col='S', strike_col='K', annualized_tte_col='t',
-            riskfree_rate_col='r', sigma_col='sigma', dividend_col='q', model='black_scholes_merton'
+            riskfree_rate_col='r', sigma_col='sigma', dividend_col='q'
         )
 
         price_grid = greeks_df['Price'].values.reshape(S_grid.shape)
