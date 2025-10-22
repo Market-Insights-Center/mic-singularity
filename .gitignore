@@ -179,3 +179,30 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# --- M.I.C. Singularity Specific Ignores ---
+
+# CRITICAL: Ignore configuration file with API keys
+config.ini
+
+# Ignore generated data files and databases
+*.csv
+*.json
+*.log
+*.txt
+
+# Allow specific text files that are part of the app's config
+!gics_map.txt
+!system_prompt.txt
+!gics_database.txt
+
+# Ignore user data
+users_favorites.txt
+user_preferences.json
+
+# Ignore generated portfolio outputs
+portfolio_outputs/
+
+# Ignore Python virtual environments
+.venv/
+venv/
