@@ -13,48 +13,38 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from tabulate import tabulate
 
 # --- Helper Function 1: Technical Indicators (from Singularity) ---
-def calculate_technical_indicators(data: pd.DataFrame, freq: str = 'D') -> pd.DataFrame:
+def calculate_technical_indicators(data: pd.DataFrame) -> pd.DataFrame:
     """
     Calculates a set of technical indicators and adds them to the DataFrame.
     This version is from the main Singularity 19.09.25 file.
-    freq: 'D' for daily, 'W' for weekly. Affects window sizes.
     """
     try:
         if 'Close' not in data.columns:
             raise KeyError("Required 'Close' column not found.")
         
         # 1. 14-day RSI (Relative Strength Index)
-        # Use 14 periods for daily, 3 periods for weekly (~14-15 days)
-        rsi_window = 14 if freq == 'D' else 3
         delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=rsi_window).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_window).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         with np.errstate(divide='ignore', invalid='ignore'):
             rs = gain / loss
         rs.replace([np.inf], 999999, inplace=True)
         rs.fillna(0, inplace=True)
         data['RSI'] = 100 - (100 / (1 + rs))
 
-        # 2. MACD value and MACD signal line (EWM spans are less freq-dependent)
+        # 2. MACD value and MACD signal line
         exp1 = data['Close'].ewm(span=12, adjust=False).mean()
         exp2 = data['Close'].ewm(span=26, adjust=False).mean()
         data['MACD'] = exp1 - exp2
         data['MACD_Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
 
         # 3. The percentage difference between the 50-day and 200-day SMAs
-        # Use 50/200 for daily, 10/40 for weekly (approx 50/200 trading days)
-        sma50_window = 50 if freq == 'D' else 10
-        sma200_window = 200 if freq == 'D' else 40
-        sma50 = data['Close'].rolling(window=sma50_window).mean()
-        sma200 = data['Close'].rolling(window=sma200_window).mean()
+        sma50 = data['Close'].rolling(window=50).mean()
+        sma200 = data['Close'].rolling(window=200).mean()
         data['SMA_Diff'] = ((sma50 - sma200) / sma200) * 100
 
         # 4. 30-day historical volatility
-        # Use 30 for daily, 6 for weekly (approx 30 trading days)
-        vol_window = 30 if freq == 'D' else 6
-        # Annualization factor
-        ann_factor = np.sqrt(252) if freq == 'D' else np.sqrt(52)
-        data['Volatility'] = data['Close'].pct_change().rolling(window=vol_window).std() * ann_factor
+        data['Volatility'] = data['Close'].pct_change().rolling(window=30).std() * np.sqrt(252)
         
         return data
     except Exception:
@@ -192,9 +182,7 @@ async def handle_mlforecast_command(args: List[str] = None, ai_params: dict = No
             data_daily.columns = data_daily.columns.get_level_values(0)
         # --- END OF FIX ---
 
-        # --- FIX: Resample and drop NaN weeks to avoid sparse data issues ---
-        data_weekly = data_daily.resample('W-FRI').last().dropna(subset=['Close'])
-        # --- END FIX ---
+        data_weekly = data_daily.resample('W-FRI').last()
         
         all_forecast_horizons = {
             "5-Day": {"days": 5, "data": data_daily, "min_hist_days": 90},
@@ -223,12 +211,7 @@ async def handle_mlforecast_command(args: List[str] = None, ai_params: dict = No
         for period_name, params in forecast_horizons_to_run.items():
             if not is_called_by_ai: print(f"\n-> Processing {period_name} forecast...")
             horizon, data = params["days"], params["data"].copy()
-            
-            # --- FIX: Determine frequency and pass to indicator function ---
-            freq_unit = 'W' if params["data"] is data_weekly else 'D'
-            data = calculate_technical_indicators(data, freq=freq_unit)
-            # --- END FIX ---
-
+            data = calculate_technical_indicators(data)
             features = ['RSI', 'MACD', 'MACD_Signal', 'SMA_Diff', 'Volatility']
             
             if not all(feature in data.columns and not data[feature].isnull().all() for feature in features):
@@ -255,8 +238,8 @@ async def handle_mlforecast_command(args: List[str] = None, ai_params: dict = No
             
             results.append({"Period": period_name, "Prediction": "UP" if direction_pred == 1 else "DOWN", "Confidence": f"{confidence:.0f}%", "Est. % Change": f"{magnitude_pred:+.2f}%"})
             
-            # Use the freq_unit variable defined above
-            forecast_date = true_last_date + pd.Timedelta(weeks=horizon) if freq_unit == 'W' else true_last_date + pd.Timedelta(days=horizon)
+            time_delta_unit = 'W' if params["data"] is data_weekly else 'D'
+            forecast_date = true_last_date + pd.Timedelta(weeks=horizon) if time_delta_unit == 'W' else true_last_date + pd.Timedelta(days=horizon)
             forecast_price = last_price * (1 + (magnitude_pred / 100))
             forecast_points.append({'date': forecast_date, 'price': forecast_price})
 
@@ -266,11 +249,7 @@ async def handle_mlforecast_command(args: List[str] = None, ai_params: dict = No
         # 3. Generate the "Raw" Weekly Forecast Path (CLI Only)
         print("\n-> Generating raw 52-week forecast path (this may take a moment)...")
         weekly_data_base = data_weekly.copy()
-        
-        # --- FIX: Call indicator function with correct frequency ---
-        weekly_data_base = calculate_technical_indicators(weekly_data_base, freq='W')
-        # --- END FIX ---
-        
+        weekly_data_base = calculate_technical_indicators(weekly_data_base)
         features_w = ['RSI', 'MACD', 'MACD_Signal', 'SMA_Diff', 'Volatility']
         
         if all(f in weekly_data_base.columns and not weekly_data_base[f].isnull().all() for f in features_w):

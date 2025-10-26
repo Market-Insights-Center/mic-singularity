@@ -1,9 +1,8 @@
-# favorites_command.py
 
 # --- Imports for favorites_command ---
 import os
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 # --- Constants (copied for self-containment) ---
 USER_PREFERENCES_FILE = 'user_preferences.json'
@@ -33,102 +32,73 @@ async def update_user_preference_tool(key: str, value: Any) -> Dict[str, Any]:
     except IOError as e:
         return {"status": "error", "message": f"Failed to save preferences: {e}"}
 
-# --- Main Command Handler (Unified for User and AI) ---
+# --- Main Command Handler ---
 
-async def handle_favorites_command(
-    args: Optional[List[str]] = None, 
-    ai_params: Optional[Dict[str, Any]] = None,
-    is_called_by_ai: bool = False
-) -> Dict[str, Any]:
+async def handle_favorites_command(args: List[str], is_called_by_ai: bool = False, **kwargs):
     """
-    Manages the user's list of favorite tickers.
+    Manages the user's list of favorite tickers from the CLI.
     Supports viewing, adding, removing, and overwriting the list.
-    This function is universal and handles calls from both the CLI and the AI.
     """
-    action: Optional[str] = None
-    tickers_to_process: set = set()
+    if is_called_by_ai:
+        # This function is designed for CLI interaction. The AI uses a different tool.
+        return {"status": "error", "message": "This specific handler is for CLI use. AI should use 'manage_user_favorites_tool'."}
 
-    # --- Step 1: Parse input from either the user (args) or the AI (ai_params) ---
-    if is_called_by_ai and ai_params:
-        action = ai_params.get('action', 'view').lower()
-        tickers_list = ai_params.get('tickers', [])
-        if tickers_list:
-            tickers_to_process = {t.strip().upper() for t in tickers_list if t.strip()}
-    elif args:
-        action = args[0].lower() if args else 'view'
-        tickers_str = " ".join(args[1:]) if len(args) > 1 else ''
-        if tickers_str:
-            tickers_to_process = {t.strip().upper() for t in tickers_str.replace(',', ' ').split() if t.strip()}
-    else: # Default action if no args are provided
-        action = 'view'
+    print("\n--- Manage Favorite Tickers ---")
+    
+    action = args[0].lower() if args else 'view'
+    tickers_str = " ".join(args[1:]) if len(args) > 1 else ''
 
-    # --- Step 2: Load current state ---
     preferences = load_user_preferences()
     current_favorites = preferences.get('favorite_tickers', [])
     current_favorites_set = set(current_favorites)
-    
-    message = ""
-    updated_list = current_favorites # Default to the current list
 
-    # --- Step 3: Perform the requested action ---
     if action == 'view':
         if current_favorites:
-            message = f"Your current saved list is: {', '.join(sorted(current_favorites))}"
+            print(f"Your current saved list is: {', '.join(sorted(current_favorites))}")
         else:
-            message = "You do not have any saved favorite tickers yet."
-        
-        if not is_called_by_ai:
-            print(message)
-        return {"status": "success", "message": message, "favorites": sorted(current_favorites)}
+            print("You do not have any saved favorite tickers yet.")
+        return
 
-    if action in ['add', 'remove', 'overwrite'] and not tickers_to_process:
-        error_msg = f"Error: The '{action}' action requires a list of tickers."
-        if not is_called_by_ai:
-            print(error_msg)
-        return {"status": "error", "message": error_msg}
+    if action in ['add', 'remove', 'overwrite'] and not tickers_str:
+        print(f"Error: The '{action}' action requires a comma-separated list of tickers.")
+        print("Usage: /favorites add AAPL,MSFT")
+        return
 
+    tickers_to_process = {t.strip().upper() for t in tickers_str.replace(',', ' ').split() if t.strip()}
+    
     if action == 'add':
         new_tickers = tickers_to_process - current_favorites_set
         if not new_tickers:
-            message = "No new tickers to add. The provided tickers are already in your list."
-        else:
-            updated_list = sorted(list(current_favorites_set.union(new_tickers)))
-            message = f"Added {len(new_tickers)} ticker(s): {', '.join(sorted(list(new_tickers)))}."
+            print("No new tickers to add. The provided tickers are already in your list.")
+            return
+        updated_list = sorted(list(current_favorites_set.union(new_tickers)))
+        message = f"Added {len(new_tickers)} ticker(s): {', '.join(sorted(list(new_tickers)))}."
     
     elif action == 'remove':
         removed_tickers = current_favorites_set.intersection(tickers_to_process)
         if not removed_tickers:
-            message = "None of the specified tickers were found in your favorites list."
-        else:
-            updated_list = sorted(list(current_favorites_set - removed_tickers))
-            message = f"Removed {len(removed_tickers)} ticker(s): {', '.join(sorted(list(removed_tickers)))}."
+            print("None of the specified tickers were found in your favorites list.")
+            return
+        updated_list = sorted(list(current_favorites_set - removed_tickers))
+        message = f"Removed {len(removed_tickers)} ticker(s): {', '.join(sorted(list(removed_tickers)))}."
 
     elif action == 'overwrite':
         updated_list = sorted(list(tickers_to_process))
         message = "Your favorites list has been overwritten."
 
     else:
-        error_msg = f"Unknown action: '{action}'. Valid actions are view, add, remove, overwrite."
-        if not is_called_by_ai:
-            print(error_msg)
-        return {"status": "error", "message": error_msg}
+        print(f"Unknown action: '{action}'.")
+        print("Usage: /favorites [view|add|remove|overwrite] [TICKERS]")
+        print("Example: /favorites add AAPL,MSFT")
+        return
 
-    # --- Step 4: Save the changes and prepare the response ---
     save_result = await update_user_preference_tool(key='favorite_tickers', value=updated_list)
 
     if save_result.get("status") == "success":
-        final_message = f"Success! {message}"
+        print(f"\n✅ Success! {message}")
         if updated_list:
-            final_message += f" Your new list is: {', '.join(updated_list)}"
+            print(f"Your new list is: {', '.join(updated_list)}")
         else:
-            final_message += " Your favorites list is now empty."
-            
-        if not is_called_by_ai:
-            print(f"\n✅ {final_message}")
-            
-        return {"status": "success", "message": final_message, "new_list": updated_list}
+            print("Your favorites list is now empty.")
     else:
-        error_msg = f"Could not save your new list. {save_result.get('message')}"
-        if not is_called_by_ai:
-            print(f"\n❌ Error: {error_msg}")
-        return {"status": "error", "message": error_msg}
+        print(f"\n❌ Error: Could not save your new list. {save_result.get('message')}")
