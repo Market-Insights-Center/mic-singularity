@@ -27,11 +27,11 @@ from io import StringIO
 
 # --- Imports from other command modules ---
 from invest_command import handle_invest_command
-from risk_command import perform_risk_calculations_singularity #type: ignore
-from breakout_command import run_breakout_analysis_singularity #type: ignore
+from risk_command import perform_risk_calculations_singularity
+from breakout_command import run_breakout_analysis_singularity
 # --- FIX: Direct imports for self-contained parallel tasks ---
-from powerscore_command import handle_powerscore_command #type: ignore
-from sentiment_command import handle_sentiment_command #type: ignore
+from powerscore_command import handle_powerscore_command
+from sentiment_command import handle_sentiment_command
 
 REPORTS_DATA_FILE = 'generated_reports.json'
 
