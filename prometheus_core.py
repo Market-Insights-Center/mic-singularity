@@ -17,34 +17,32 @@ import numpy as np
 from tabulate import tabulate
 import os
 import inspect # For signature checking
+import re # Added for parsing AI response
 
 # --- Constants ---
 SYNTHESIZED_WORKFLOWS_FILE = 'synthesized_workflows.json'
 
 # --- Prometheus Core Logger ---
+# ... (logger setup remains the same) ...
 prometheus_logger = logging.getLogger('PROMETHEUS_CORE')
-prometheus_logger.setLevel(logging.DEBUG) # <<< Set logger level to DEBUG for more detail
+prometheus_logger.setLevel(logging.DEBUG)
 prometheus_logger.propagate = False
 if not prometheus_logger.hasHandlers():
     prometheus_log_file = 'prometheus_core.log'
-    # Use RotatingFileHandler for better log management
     from logging.handlers import RotatingFileHandler
-    # --- MODIFICATION: Added encoding='utf-8' ---
-    prometheus_file_handler = RotatingFileHandler(prometheus_log_file, maxBytes=5*1024*1024, backupCount=2, encoding='utf-8') # 5MB limit, 2 backups
-    prometheus_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s') # More detail in format
+    prometheus_file_handler = RotatingFileHandler(prometheus_log_file, maxBytes=5*1024*1024, backupCount=2, encoding='utf-8')
+    prometheus_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
     prometheus_file_handler.setFormatter(prometheus_formatter)
     prometheus_logger.addHandler(prometheus_file_handler)
-    # Add a handler to also print DEBUG messages to console
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG) # <<< Print DEBUG to console
-    # Use a simpler format for console to reduce noise
+    console_handler.setLevel(logging.DEBUG)
     console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_formatter)
     prometheus_logger.addHandler(console_handler)
 
 
 # --- Robust YFinance Download Helper ---
-# (get_yf_download_robustly remains the same)
+# ... (get_yf_download_robustly remains the same) ...
 async def get_yf_download_robustly(tickers: list, **kwargs) -> pd.DataFrame:
     """ Robust wrapper for yf.download with retry logic and standardization. """
     max_retries = 2
@@ -88,7 +86,7 @@ async def get_yf_download_robustly(tickers: list, **kwargs) -> pd.DataFrame:
 
 
 # --- Minimal calculate_ema_invest for context fetching ---
-# (Added initialization fix for close_col_tuple)
+# ... (calculate_ema_invest_minimal remains the same) ...
 async def calculate_ema_invest_minimal(ticker: str, ema_interval: int = 2) -> Optional[float]:
     """ Minimal version to get INVEST score for context. """
     interval_map = {1: "1wk", 2: "1d", 3: "1h"}; period_map = {1: "max", 2: "10y", 3: "2y"}
@@ -108,8 +106,9 @@ async def calculate_ema_invest_minimal(ticker: str, ema_interval: int = 2) -> Op
         return float(ema_invest_score)
     except Exception as e: prometheus_logger.warning(f"Context EMA Invest calc failed for {ticker}: {e}"); return None
 
+
 # --- Helper for Context Enhancement ---
-# (Added initialization fix for close_col_tuple)
+# ... (_calculate_perc_changes remains the same) ...
 async def _calculate_perc_changes(ticker: str) -> Dict[str, str]:
     """Fetches 5 years of data using robust helper and calculates % changes."""
     changes = { "1d": "N/A", "1w": "N/A", "1mo": "N/A", "3mo": "N/A", "1y": "N/A", "5y": "N/A" }
@@ -209,6 +208,7 @@ class Prometheus:
 
     # --- UPDATED: get_market_context with more DEBUG logging ---
     async def get_market_context(self) -> Dict[str, Any]:
+        # ... (get_market_context remains the same) ...
         """ Fetches market context including risk scores and % changes with enhanced logging. """
         prometheus_logger.info("Starting context fetch...")
         print("[CONTEXT DEBUG] Starting context fetch...") # <<< DEBUG
@@ -340,6 +340,7 @@ class Prometheus:
 
     # --- UPDATED: execute_and_log fixes arg passing and None return ---
     async def execute_and_log(self, command_name_with_slash: str, args: List[str] = None, ai_params: Optional[Dict] = None, called_by_user: bool = False, internal_call: bool = False) -> Any:
+        # ... (execute_and_log remains largely the same, ensure the `kwargs_to_pass` for memo and strategy_recipe are correct) ...
         start_time = datetime.now(); command_name = command_name_with_slash.lstrip('/'); context = {}
         if not internal_call: context = await self.get_market_context()
         command_func = self.toolbox.get(command_name); log_id = None
@@ -363,31 +364,33 @@ class Prometheus:
             expects_args = 'args' in func_params
             expects_ai_params = 'ai_params' in func_params
 
-            # --- *** Corrected Argument Logic *** ---
+            # --- *** Argument Logic *** ---
             if expects_args:
-                # If function expects 'args', pass it whether user or internal call
                 kwargs_to_pass["args"] = args if called_by_user and args is not None else []
             if expects_ai_params:
-                # If function expects 'ai_params', pass it if internal/AI call, otherwise empty dict
                 kwargs_to_pass["ai_params"] = ai_params if not called_by_user and ai_params is not None else {}
             if 'is_called_by_ai' in func_params:
                 kwargs_to_pass["is_called_by_ai"] = not called_by_user
-            # --- *** End Correction *** ---
 
-            # (Dependency injection remains the same)
-            if "gemini_model_obj" in func_params and command_name in ["dev", "report", "compare", "powerscore", "sentiment", "reportgeneration"]: kwargs_to_pass["gemini_model_obj"] = self.gemini_model
+            # (Dependency injection for AI models, locks, etc.)
+            if "gemini_model_obj" in func_params and command_name in ["dev", "report", "compare", "powerscore", "sentiment", "reportgeneration", "memo", "strategy_recipe"]: # <<< Added strategy_recipe
+                 kwargs_to_pass["gemini_model_obj"] = self.gemini_model
             if "api_lock_override" in func_params and command_name in ["powerscore", "sentiment"]:
                  try: from main_singularity import GEMINI_API_LOCK; kwargs_to_pass["api_lock_override"] = GEMINI_API_LOCK
                  except ImportError: prometheus_logger.warning(f"Could not import GEMINI_API_LOCK for {command_name}")
             if "screener_func" in func_params and command_name == "dev": kwargs_to_pass["screener_func"] = self.screener_func
             if command_name == "reportgeneration" and "available_functions" in func_params : kwargs_to_pass["available_functions"] = self.toolbox
+            # --- Pass Prometheus instance to memo and strategy_recipe commands ---
+            if command_name in ["memo", "strategy_recipe"] and "prometheus_instance" in func_params:
+                kwargs_to_pass["prometheus_instance"] = self
 
             prometheus_logger.debug(f"Calling {command_name} with actual kwargs: {kwargs_to_pass}")
             if asyncio.iscoroutinefunction(command_func): result = await command_func(**kwargs_to_pass)
             else: result = await asyncio.to_thread(lambda: command_func(**kwargs_to_pass))
             prometheus_logger.debug(f"Result from {command_name}: {type(result)} - {str(result)[:100]}...")
             success_flag = True
-            # --- Refined Result Summarization Logic (remains the same) ---
+            # --- Result Summarization Logic ---
+            # ... (keep existing summarization, add cases for memo and strategy_recipe) ...
             if result is None: output_summary = f"{command_name_with_slash} completed (printed output or None)."
             elif isinstance(result, str):
                  if "error" in result.lower() or "failed" in result.lower(): success_flag = False
@@ -405,12 +408,14 @@ class Prometheus:
                      elif command_name == "derivative" and 'summary' in result: output_summary = result['summary'][:1000]
                      elif command_name == "quickscore": output_summary = result.get("summary", result.get("message", str(result)))[:1000] # Check dict first
                      elif command_name.startswith("synthesized_") and 'summary' in result: output_summary = result['summary'][:1000]
+                     elif command_name == "memo" and 'memo_text' in result: output_summary = "Market Memo generated successfully."
+                     elif command_name == "strategy_recipe" and 'recipe_steps' in result: output_summary = f"Strategy Recipe generated ({len(result['recipe_steps'])} steps)." # <<< Summary for recipe
                      elif 'summary' in result: output_summary = str(result['summary'])[:1000]
                      elif 'message' in result: output_summary = str(result['message'])[:1000]
                      else: output_summary = f"{command_name_with_slash} success (dict)."
                  else: output_summary = f"{command_name_with_slash} completed (dict)."
+            # ... (keep handling for tuple, list, DataFrame etc.) ...
             elif isinstance(result, tuple):
-                 # ... (Keep tuple handling logic) ...
                  if command_name in ["invest", "cultivate"] and len(result) >= 4:
                      holdings_data = result[3] if len(result[3]) > 0 else result[1]; num_holdings = len(holdings_data) if isinstance(holdings_data, list) else 0; cash_val = result[2]
                      output_summary = f"{command_name.capitalize()} done. Holdings: {num_holdings}. Cash: ${cash_val:,.2f}"
@@ -457,6 +462,7 @@ class Prometheus:
 
     # --- UPDATED: analyze_workflows for 2-step sequences ---
     async def analyze_workflows(self):
+        # ... (analyze_workflows remains the same) ...
         prometheus_logger.info("Analyzing command history for potential 2-step workflows...")
         print("[Prometheus Workflow] Analyzing command history for 2-step patterns...")
         conn = sqlite3.connect(self.db_path)
@@ -498,6 +504,7 @@ class Prometheus:
 
     # --- UPDATED: _create_and_register_workflow_function for 2 steps ---
     async def _create_and_register_workflow_function(self, sequence: List[str], command_name_with_slash: str, load_only: bool = False):
+        # ... (_create_and_register_workflow_function remains the same) ...
         """ Internal helper for the 2-step /breakout -> /quickscore workflow. """
         prometheus_logger.info(f"{'Loading' if load_only else 'Creating'} 2-step workflow function for '{command_name_with_slash}'")
         command_name_no_slash = command_name_with_slash.lstrip('/')
@@ -549,6 +556,7 @@ class Prometheus:
 
     # --- Synchronous wrapper for loading ---
     def _create_and_register_workflow_function_sync(self, sequence: List[str], command_name_with_slash: str):
+        # ... (_create_and_register_workflow_function_sync remains the same) ...
         """ Synchronous version for loading during initialization. """
         # (Keep existing implementation - defines async func but registers sync)
         command_name_no_slash = command_name_with_slash.lstrip('/')
@@ -602,7 +610,7 @@ class Prometheus:
             prometheus_logger.exception(f"Error saving definition for {command_name_with_slash}: {e}"); print(f"   -> Prometheus Synthesis: [ERROR] saving workflow: {e}")
 
     # --- Background Correlation Analysis ---
-    # (background_correlation_analysis remains the same)
+    # ... (background_correlation_analysis remains the same) ...
     async def background_correlation_analysis(self):
         try: from main_singularity import get_sp500_symbols_singularity
         except ImportError: prometheus_logger.error("Failed import get_sp500_symbols_singularity."); return
@@ -670,9 +678,236 @@ class Prometheus:
              finally: cycle_end_time = datetime.now(); duration = cycle_end_time - cycle_start_time; prometheus_logger.info(f"BG cycle finished. Duration: {duration}"); print(f"[Prometheus Background] Cycle finished @ {cycle_end_time.strftime('%H:%M:%S')} (Duration: {duration}).")
 
 
+    # --- Market Memo Generation ---
+    async def generate_market_memo(self, args: List[str] = None, ai_params: Optional[Dict] = None, is_called_by_ai: bool = False, prometheus_instance: 'Prometheus' = None, gemini_model_obj: Any = None):
+        # ... (generate_market_memo remains the same) ...
+        """
+        Analyzes recent logs and market context to generate a daily memo.
+        Called via the /memo command.
+        """
+        prometheus_logger.info("Generating Market Memo...")
+        print("\n--- Generating Prometheus Market Memo ---")
+        if not self.gemini_model:
+            print("❌ Error: Gemini model not initialized. Cannot generate memo.")
+            return {"status": "error", "message": "Gemini model not available."}
+
+        # 1. Fetch Current Market Context
+        print("  -> Fetching current market context (/risk)...")
+        market_context_dict = {}
+        try:
+            # Use execute_and_log to ensure proper context fetching and logging
+            risk_result = await self.execute_and_log("/risk", ai_params={"assessment_type": "standard"}, internal_call=True)
+            if isinstance(risk_result, dict) and risk_result.get("status") != "error":
+                 # Extract key pieces of info
+                 market_context_dict['VIX Price'] = risk_result.get('vix_price', 'N/A')
+                 market_context_dict['Market Invest Score'] = risk_result.get('market_invest_score', 'N/A')
+                 market_context_dict['Combined Score'] = risk_result.get('combined_score', 'N/A')
+                 market_context_dict['Market IVR'] = risk_result.get('market_ivr', 'N/A') # From updated /risk
+                 print("     ...Market context fetched.")
+            else:
+                 print("     ⚠️ Warning: Failed to fetch market context via /risk.")
+                 market_context_dict['Status'] = 'Market context unavailable'
+        except Exception as e_ctx:
+            print(f"     ❌ Error fetching market context: {e_ctx}")
+            market_context_dict['Status'] = f'Error fetching context: {e_ctx}'
+
+        # 2. Query Recent Command Log (Knowledge Base)
+        print("  -> Querying recent command history...")
+        recent_logs = []
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            # Fetch last 10 successful commands from the past 24 hours
+            cutoff_time = (datetime.now() - timedelta(hours=24)).isoformat()
+            cursor.execute("""
+                SELECT command, parameters, output_summary
+                FROM command_log
+                WHERE success = 1 AND timestamp >= ?
+                ORDER BY id DESC
+                LIMIT 10
+            """, (cutoff_time,))
+            rows = cursor.fetchall()
+            if rows:
+                recent_logs = [{"command": r[0], "params": r[1], "summary": r[2]} for r in rows]
+                print(f"     ...Found {len(recent_logs)} relevant recent command logs.")
+            else:
+                print("     ...No relevant command logs found in the last 24 hours.")
+            conn.close()
+        except Exception as e_db:
+            print(f"     ❌ Error querying command log: {e_db}")
+            if conn: conn.close()
+            recent_logs = [{"error": f"Failed to query logs: {e_db}"}]
+
+        # 3. Construct Prompt for Gemini
+        print("  -> Constructing prompt for AI memo generation...")
+        today_date = datetime.now().strftime('%B %d, %Y')
+        prompt = f"""
+        Act as Prometheus, an AI market analyst. Today is {today_date}.
+        Generate a concise "Market Memo" (3-5 sentences) based ONLY on the provided context and recent command activity.
+
+        **Current Market Context:**
+        {json.dumps(market_context_dict, indent=2)}
+
+        **Recent Successful Command Summaries (last 24h, max 10):**
+        {json.dumps(recent_logs, indent=2)}
+
+        **Instructions:**
+        1.  Synthesize the market context (scores, VIX, IVR) and recent command results.
+        2.  Identify potential trends, shifts, or notable findings (e.g., strong sector sentiment, recurring breakout patterns, interesting correlations found).
+        3.  Suggest 1-2 potentially relevant strategies or areas of focus given the current conditions, referencing specific tools (like /sector, /assess, /powerscore) if applicable.
+        4.  Keep the memo brief and action-oriented. Avoid definitive predictions.
+        5.  Do NOT invent data not present in the context or logs. If context/logs are unavailable or empty, state that the analysis is limited.
+
+        **Market Memo for {today_date}:**
+        """
+
+        # 4. Generate Memo using Gemini
+        print("  -> Sending request to Gemini for memo generation...")
+        memo_text = "Error: Memo generation failed."
+        try:
+             # Use the Gemini model instance associated with Prometheus
+             response = await asyncio.to_thread(
+                 self.gemini_model.generate_content,
+                 prompt,
+                 generation_config=genai.types.GenerationConfig(temperature=0.5) # Allow some creativity
+             )
+             if response and response.text:
+                  memo_text = response.text.strip()
+                  print("     ...Memo generated successfully.")
+             else:
+                  print("     ⚠️ Warning: AI returned an empty response.")
+                  memo_text = "Memo Generation Error: AI returned no text."
+
+        except Exception as e_ai:
+             print(f"     ❌ Error during AI memo generation: {e_ai}")
+             memo_text = f"Memo Generation Error: {e_ai}"
+
+        # 5. Display Memo
+        print("\n" + "="*25 + " Prometheus Market Memo " + "="*25)
+        print(f"Date: {today_date}\n")
+        print(memo_text)
+        print("="*72)
+
+        # Log this action separately? Or rely on the /memo command log entry?
+        # For now, rely on the /memo entry in execute_and_log.
+
+        return {"status": "success", "memo_text": memo_text} # Return dict for logging
+
+    # <<< --- NEW: Strategy Recipe Generation --- >>>
+    async def generate_strategy_recipe(self, args: List[str] = None, ai_params: Optional[Dict] = None, is_called_by_ai: bool = False, called_by_user: bool = False, prometheus_instance: 'Prometheus' = None, gemini_model_obj: Any = None): # <<< Added called_by_user parameter
+        """
+        Uses the AI to generate a step-by-step strategy recipe based on a user's goal.
+        Called via the /strategy_recipe command.
+        """
+        prometheus_logger.info("Generating Strategy Recipe...")
+        print("\n--- Generating Prometheus Strategy Recipe ---")
+        if not self.gemini_model:
+            print("❌ Error: Gemini model not initialized. Cannot generate recipe.")
+            return {"status": "error", "message": "Gemini model not available."}
+
+        # 1. Get User Goal
+        user_goal = ""
+        # Use the now defined 'called_by_user' variable
+        if called_by_user and args:
+            user_goal = " ".join(args)
+        elif not called_by_user and ai_params: # If called internally by AI
+            user_goal = ai_params.get("goal", "")
+        elif called_by_user: # Interactive prompt if no args from user
+            # --- Use the existing helper for interactive input ---
+            # user_goal = input("Enter your high-level strategy goal (e.g., 'find undervalued high-growth tech stocks'): ")
+            # --- Import ask_singularity_input helper if not already available ---
+            # --- Or, assume this interactive part only happens via Prometheus shell ---
+            # --- For simplicity, let's assume direct /strategy_recipe always gets args ---
+            # --- and Prometheus shell handles its own input ---
+            # --- Let's revert to the original logic slightly modified ---
+            # --- The primary way this function is called by a user is via the /strategy_recipe command,
+            # --- which passes 'args'. The Prometheus shell ('generate recipe ...') also passes 'args'.
+            # --- So, we primarily need 'args' when called_by_user is True.
+             if not args: # Check if args is empty when called by user
+                 print("Error: Please provide a strategy goal after the command.")
+                 return {"status": "error", "message": "Strategy goal is required when called by user."}
+             user_goal = " ".join(args) # Re-added this line for clarity
+
+
+        if not user_goal:
+            print("❌ Error: No strategy goal provided.")
+            return {"status": "error", "message": "Strategy goal is required."}
+
+        prometheus_logger.debug(f"User goal for recipe: {user_goal}")
+        print(f"  -> User Goal: '{user_goal}'")
+
+        # 2. Get Available Tool Names (excluding self)
+        available_tool_list = [f"/{name}" for name in self.toolbox.keys() if name != "strategy_recipe"]
+        prometheus_logger.debug(f"Available tools for recipe: {available_tool_list}")
+
+        # 3. Construct Prompt for Gemini
+        print("  -> Constructing prompt for AI recipe generation...")
+        prompt = f"""
+        Act as Prometheus, an AI strategist. Your task is to design a step-by-step investment strategy based on the user's high-level goal, using ONLY the available tools.
+
+        **User's Goal:** "{user_goal}"
+
+        **Available Tools:**
+        {', '.join(available_tool_list)}
+
+        **Instructions:**
+        1.  Analyze the user's goal.
+        2.  Create a logical sequence of 3-7 steps using the available tools to achieve the goal.
+        3.  For each step, clearly state the tool to use (e.g., "/sector") and the specific parameters needed (e.g., "Semiconductors & Semiconductor Equipment"). If parameters depend on previous steps, explain how (e.g., "Run /powerscore on the top 5 tickers from step 3").
+        4.  Focus ONLY on creating the recipe steps. Do NOT execute the strategy.
+        5.  Format your response clearly using numbered steps. Start directly with step 1.
+        6.  If a goal seems impossible or requires unavailable tools, state that clearly instead of generating steps.
+
+        **Proposed Strategy Recipe:**
+        """
+
+        # 4. Generate Recipe using Gemini
+        print("  -> Sending request to Gemini for recipe generation...")
+        recipe_text = "Error: Recipe generation failed."
+        recipe_steps = []
+        try:
+             response = await asyncio.to_thread(
+                 self.gemini_model.generate_content,
+                 prompt,
+                 generation_config=genai.types.GenerationConfig(temperature=0.3) # More focused output
+             )
+             if response and response.text:
+                  raw_text = response.text.strip()
+                  # Basic parsing: split by lines starting with a number and a dot.
+                  potential_steps = re.split(r'\n\s*(?=\d+\.\s)', raw_text)
+                  recipe_steps = [step.strip() for step in potential_steps if step.strip()]
+                  if recipe_steps:
+                      recipe_text = "\n".join(recipe_steps)
+                      print("     ...Recipe generated successfully.")
+                  else:
+                      # Handle cases where AI might respond without numbered steps
+                      recipe_text = raw_text # Use the raw text if parsing fails
+                      print("     ⚠️ Warning: AI response formatting might be unexpected.")
+             else:
+                  print("     ⚠️ Warning: AI returned an empty response.")
+                  recipe_text = "Recipe Generation Error: AI returned no text."
+                  recipe_steps = [recipe_text]
+
+        except Exception as e_ai:
+             print(f"     ❌ Error during AI recipe generation: {e_ai}")
+             recipe_text = f"Recipe Generation Error: {e_ai}"
+             recipe_steps = [recipe_text]
+
+        # 5. Display Recipe
+        print("\n" + "="*25 + " Prometheus Strategy Recipe " + "="*25)
+        print(f"Goal: {user_goal}\n")
+        print("Proposed Strategy:")
+        print(recipe_text)
+        print("="*74)
+
+        prometheus_logger.info(f"Generated strategy recipe for goal: {user_goal}")
+        return {"status": "success", "recipe_steps": recipe_steps} # Return dict for logging
+    # <<< --- END: Strategy Recipe Generation --- >>>
+    
     async def start_interactive_session(self):
-        # (Keep existing implementation)
-        print("\n--- Prometheus Meta-AI Shell ---"); print("Available commands: analyze patterns, check correlations, query log <limit>, exit"); prometheus_logger.info("Entered Prometheus interactive shell.")
+        # ... (start_interactive_session updated to include 'generate recipe') ...
+        print("\n--- Prometheus Meta-AI Shell ---"); print("Available commands: analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, exit"); prometheus_logger.info("Entered Prometheus interactive shell.") # Added generate recipe
         while True:
             try:
                 user_input = await asyncio.to_thread(input, "Prometheus> "); user_input_lower = user_input.lower().strip(); parts = user_input.split(); cmd = parts[0].lower() if parts else ""
@@ -684,10 +919,16 @@ class Prometheus:
                      elif self.correlation_task and not self.correlation_task.done(): print("   -> Correlation task is already running.")
                      else: print("   -> Cannot run correlation analysis - required functions missing.")
                 elif cmd == "query" and len(parts)>1 and parts[1].lower() == "log": limit = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 10; await self._query_log_db(limit)
-                else: print("Unknown command. Available: analyze patterns, check correlations, query log <limit>, exit")
+                elif cmd == "generate" and len(parts)>1 and parts[1].lower() == "memo": await self.generate_market_memo()
+                elif cmd == "generate" and len(parts)>1 and parts[1].lower() == "recipe":
+                    goal_parts = parts[2:]
+                    if not goal_parts: print("Please provide a goal after 'generate recipe'.")
+                    else: await self.generate_strategy_recipe(args=[" ".join(goal_parts)], called_by_user=True) # <<< Call recipe generation
+                else: print("Unknown command. Available: analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, exit") # Added generate recipe
             except EOFError: prometheus_logger.warning("EOF received, exiting Prometheus shell."); break
             except Exception as e: prometheus_logger.exception(f"Error in Prometheus shell: {e}"); print(f"Error: {e}")
         print("Returning to M.I.C. Singularity main shell.")
+
 
     async def _query_log_db(self, limit: int = 10):
          # (Keep existing implementation)
