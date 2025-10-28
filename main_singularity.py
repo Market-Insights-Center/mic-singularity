@@ -346,8 +346,26 @@ def get_sp500_symbols_singularity(is_called_by_ai: bool = False) -> List[str]:
         print(f"-> Error fetching S&P 500 symbols (in main): {e}")
         return []
 
+# --- NEW: Memo Command Handler ---
+async def handle_memo_command(args: List[str], ai_params: Optional[Dict] = None, is_called_by_ai: bool = False, prometheus_instance: Prometheus = None, gemini_model_obj: Any = None):
+    """Wrapper function to call the memo generation within the Prometheus instance."""
+    if not prometheus_instance:
+        print("Error: Prometheus instance not available for memo generation.")
+        return {"status": "error", "message": "Prometheus instance missing."}
+    # Pass necessary dependencies (Prometheus instance, Gemini model)
+    return await prometheus_instance.generate_market_memo(args, ai_params, is_called_by_ai, prometheus_instance, gemini_model_obj)
+
+
+async def handle_strategy_recipe_command(args: List[str], ai_params: Optional[Dict] = None, is_called_by_ai: bool = False, prometheus_instance: Prometheus = None, gemini_model_obj: Any = None):
+    """Wrapper function to call the strategy recipe generation within the Prometheus instance."""
+    if not prometheus_instance:
+        print("Error: Prometheus instance not available for recipe generation.")
+        return {"status": "error", "message": "Prometheus instance missing."}
+    # Pass necessary dependencies (Prometheus instance, Gemini model)
+    return await prometheus_instance.generate_strategy_recipe(args, ai_params, is_called_by_ai, prometheus_instance, gemini_model_obj)
+
+
 # --- Tool Box Map Definition ---
-# Moved outside main_singularity for clarity and Prometheus initialization
 TOOLBOX_MAP: Dict[str, Callable] = {
     "briefing": handle_briefing_command,
     "breakout": handle_breakout_command,
@@ -358,23 +376,23 @@ TOOLBOX_MAP: Dict[str, Callable] = {
     "custom": handle_custom_command,
     "cultivate": handle_cultivate_command,
     "invest": handle_invest_command,
-    "assess": handle_assess_command, # Maps /assess base command
-    "comparison": get_comparison_for_custom_portfolio, # Function for comparing custom portfolios
+    "assess": handle_assess_command,
+    "comparison": get_comparison_for_custom_portfolio,
     "spear": handle_spear_command,
     "macdforecast": handle_macd_forecast_command,
-    "favorites": handle_favorites_command, # Routing CLI favorites management via Prometheus
+    "favorites": handle_favorites_command,
     "fundamentals": handle_fundamentals_command,
-    "report": handle_report_generation, # Using '/report' as the key, mapped from '/reportgeneration' if needed
+    "report": handle_report_generation,
     "sentiment": handle_sentiment_command,
     "powerscore": handle_powerscore_command,
-    "backtest": handle_backtest_command, # CLI backtest
+    "backtest": handle_backtest_command,
     "fairvalue": handle_fairvalue_command,
     "heatmap": handle_heatmap_command,
     "optimize": handle_optimize_command,
     "sector": handle_sector_command,
     "strategies": handle_strategies_command,
     "futures": handle_futures_command,
-    "compare": handle_compare_command, # Head-to-head stock compare
+    "compare": handle_compare_command,
     "derivative": handle_derivative_command,
     "mlforecast": handle_mlforecast_command,
     "options": handle_options_command,
@@ -384,16 +402,10 @@ TOOLBOX_MAP: Dict[str, Callable] = {
     "tracking": handle_tracking_command,
     "counter": handle_counter_command,
     "dev": handle_dev_command,
-    "help": handle_help_command, # Also route help through Prometheus
-    # --- AI Specific Tools (handled by AI logic, but map if needed for logging/direct call) ---
-    # "generate_ai_driven_report": generate_ai_driven_report, # Already handled via /report
-    # "create_dynamic_investment_plan": create_dynamic_investment_plan, # Already handled via /report
-    # "update_user_preference_tool": update_user_preference_tool, # Usually called by AI tool logic
-    # "get_user_preferences_tool": get_user_preferences_tool, # Usually called by AI tool logic
-    # "manage_user_favorites_tool": manage_user_favorites_tool, # Usually called by AI tool logic
-    # "find_and_screen_stocks": find_and_screen_stocks, # Usually called by AI tool logic / dev
+    "help": handle_help_command,
+    "memo": handle_memo_command,
+    "strategy_recipe": handle_strategy_recipe_command, # <<< Added strategy recipe handler
 }
-
 
 # --- Core Application Logic ---
 async def main_singularity():
@@ -417,10 +429,15 @@ async def main_singularity():
     prometheus = Prometheus(
         gemini_api_key=GEMINI_API_KEY,
         toolbox_map=TOOLBOX_MAP,
-        risk_command_func=handle_risk_command, # Pass the actual function
-        derivative_func=handle_derivative_command, # Pass the actual function
-        mlforecast_func=handle_mlforecast_command, # Pass the actual function
-        screener_func=find_and_screen_stocks # Pass the actual function for /dev
+        risk_command_func=handle_risk_command,
+        derivative_func=handle_derivative_command,
+        mlforecast_func=handle_mlforecast_command,
+        screener_func=find_and_screen_stocks,
+        # --- Make sure these are passed if available ---
+        powerscore_func=handle_powerscore_command,
+        sentiment_func=handle_sentiment_command,
+        fundamentals_func=handle_fundamentals_command,
+        quickscore_func=handle_quickscore_command
     )
     print("   -> Prometheus Core is active.")
 
