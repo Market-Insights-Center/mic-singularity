@@ -8,7 +8,7 @@ import traceback
 import random
 import sys
 import io
-import google.generativeai as genai
+import google.generativeai as genai # Ensure this is installed
 import logging
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
@@ -18,12 +18,17 @@ from tabulate import tabulate
 import os
 import inspect # For signature checking
 import re # Added for parsing AI response
+import importlib.util # Needed for dynamic loading
+import shutil # <-- ADD THIS LINE
+import uuid # Needed for temporary filenames
 
 # --- Constants ---
 SYNTHESIZED_WORKFLOWS_FILE = 'synthesized_workflows.json'
+IMPROVED_CODE_DIR = 'improved_commands' # Directory for generated code
+COMMANDS_DIR = 'Isolated Commands' # Directory for original commands
+OPTIMIZABLE_PARAMS_FILE = 'optimizable_parameters.json' # <-- NEW CONFIG FILE
 
 # --- Prometheus Core Logger ---
-# ... (logger setup remains the same) ...
 prometheus_logger = logging.getLogger('PROMETHEUS_CORE')
 prometheus_logger.setLevel(logging.DEBUG)
 prometheus_logger.propagate = False
@@ -42,7 +47,6 @@ if not prometheus_logger.hasHandlers():
 
 
 # --- Robust YFinance Download Helper ---
-# ... (get_yf_download_robustly remains the same) ...
 async def get_yf_download_robustly(tickers: list, **kwargs) -> pd.DataFrame:
     """ Robust wrapper for yf.download with retry logic and standardization. """
     max_retries = 2
@@ -51,6 +55,7 @@ async def get_yf_download_robustly(tickers: list, **kwargs) -> pd.DataFrame:
             await asyncio.sleep(random.uniform(0.3, 0.8))
             kwargs.setdefault('progress', False); kwargs.setdefault('timeout', 15); kwargs.setdefault('auto_adjust', False)
             prometheus_logger.debug(f"get_yf_download_robustly: Attempt {attempt+1} for {tickers} with kwargs: {kwargs}")
+            # Use asyncio.to_thread for blocking yf.download call
             data = await asyncio.to_thread(yf.download, tickers=tickers, **kwargs)
 
             if isinstance(data, dict):
@@ -86,14 +91,13 @@ async def get_yf_download_robustly(tickers: list, **kwargs) -> pd.DataFrame:
 
 
 # --- Minimal calculate_ema_invest for context fetching ---
-# ... (calculate_ema_invest_minimal remains the same) ...
 async def calculate_ema_invest_minimal(ticker: str, ema_interval: int = 2) -> Optional[float]:
     """ Minimal version to get INVEST score for context. """
     interval_map = {1: "1wk", 2: "1d", 3: "1h"}; period_map = {1: "max", 2: "10y", 3: "2y"}
     try:
         data = await get_yf_download_robustly(tickers=[ticker], period=period_map.get(ema_interval, "10y"), interval=interval_map.get(ema_interval, "1d"), auto_adjust=True)
         if data.empty: prometheus_logger.debug(f"calculate_ema_invest_minimal({ticker}): No data from download."); return None
-        close_prices = None; price_level_name = 'Price'; ticker_level_name = 'Ticker'; close_col_tuple = None # <<< Initialize here
+        close_prices = None; price_level_name = 'Price'; ticker_level_name = 'Ticker'; close_col_tuple = None
         if isinstance(data.columns, pd.MultiIndex):
              if ('Close', ticker) in data.columns: close_prices = data[('Close', ticker)]
              elif 'Close' in data.columns.get_level_values(price_level_name): close_col_tuple = next((col for col in data.columns if col[data.columns.names.index(price_level_name)] == 'Close'), None);
@@ -108,14 +112,14 @@ async def calculate_ema_invest_minimal(ticker: str, ema_interval: int = 2) -> Op
 
 
 # --- Helper for Context Enhancement ---
-# ... (_calculate_perc_changes remains the same) ...
 async def _calculate_perc_changes(ticker: str) -> Dict[str, str]:
     """Fetches 5 years of data using robust helper and calculates % changes."""
+    # ... (implementation remains the same) ...
     changes = { "1d": "N/A", "1w": "N/A", "1mo": "N/A", "3mo": "N/A", "1y": "N/A", "5y": "N/A" }
     try:
         data = await get_yf_download_robustly( tickers=[ticker], period="5y", interval="1d", auto_adjust=True )
         if data.empty: prometheus_logger.warning(f"No data returned for {ticker} % changes."); return changes
-        close_prices = None; price_level_name = 'Price'; ticker_level_name = 'Ticker'; close_col_tuple = None # <<< Initialize here
+        close_prices = None; price_level_name = 'Price'; ticker_level_name = 'Ticker'; close_col_tuple = None
         if isinstance(data.columns, pd.MultiIndex):
              if ('Close', ticker) in data.columns: close_prices = data[('Close', ticker)]
              elif 'Close' in data.columns.get_level_values(price_level_name): close_col_tuple = next((col for col in data.columns if col[data.columns.names.index(price_level_name)] == 'Close'), None);
@@ -129,20 +133,37 @@ async def _calculate_perc_changes(ticker: str) -> Dict[str, str]:
         for key, past_date in periods.items():
             if close_prices.index.tzinfo is None and past_date.tzinfo is not None: past_date = past_date.tz_localize(None)
             try:
-                potential_past_date = close_prices.index[close_prices.index <= past_date]
-                if not potential_past_date.empty:
-                    actual_past_date = potential_past_date[-1];
-                    if actual_past_date < now_dt: past_close_val = close_prices.asof(actual_past_date);
-                    if pd.notna(past_close_val): past_closes[key] = past_close_val
-                elif key == "5y" and len(close_prices) > 0 and pd.notna(close_prices.iloc[0]): past_closes[key] = close_prices.iloc[0]
+                potential_indices = close_prices.index[close_prices.index <= past_date]
+                if not potential_indices.empty:
+                    actual_past_date = potential_indices[-1]
+                    if actual_past_date < now_dt:
+                        past_close_val = close_prices.asof(actual_past_date)
+                        if pd.notna(past_close_val):
+                            past_closes[key] = past_close_val
+                elif key == "5y" and len(close_prices) > 0 and pd.notna(close_prices.iloc[0]):
+                    past_closes[key] = close_prices.iloc[0]
             except IndexError:
-                 if key == "5y" and len(close_prices) > 0 and pd.notna(close_prices.iloc[0]): past_closes[key] = close_prices.iloc[0]
+                 if key == "5y" and len(close_prices) > 0 and pd.notna(close_prices.iloc[0]):
+                     past_closes[key] = close_prices.iloc[0]
+
         latest_close_scalar = latest_close.item() if isinstance(latest_close, (pd.Series, pd.DataFrame)) else latest_close
+
         for key in periods.keys():
-             past_close = past_closes.get(key); past_close_scalar = past_close.item() if isinstance(past_close, (pd.Series, pd.DataFrame)) else past_close
-             if isinstance(past_close_scalar, (int, float, np.number)) and isinstance(latest_close_scalar, (int, float, np.number)) and past_close_scalar != 0 and pd.notna(past_close_scalar) and pd.notna(latest_close_scalar):
-                 change = ((latest_close_scalar - past_close_scalar) / past_close_scalar) * 100; changes[key] = f"{change:+.2f}%"
-    except Exception as e: prometheus_logger.warning(f"Failed calc within % changes for {ticker}: {e}")
+             past_close = past_closes.get(key)
+             past_close_scalar = past_close.item() if isinstance(past_close, (pd.Series, pd.DataFrame)) else past_close
+             if isinstance(past_close_scalar, (int, float, np.number)) and \
+                isinstance(latest_close_scalar, (int, float, np.number)) and \
+                past_close_scalar != 0 and \
+                pd.notna(past_close_scalar) and \
+                pd.notna(latest_close_scalar):
+                 try:
+                      change = ((latest_close_scalar - past_close_scalar) / past_close_scalar) * 100
+                      changes[key] = f"{change:+.2f}%"
+                 except ZeroDivisionError:
+                      prometheus_logger.warning(f"Zero division error calculating % change for {ticker}, key {key}. Past close: {past_close_scalar}")
+
+    except Exception as e:
+        prometheus_logger.exception(f"Unexpected error in _calculate_perc_changes for {ticker}: {e}")
     return changes
 
 
@@ -153,7 +174,6 @@ class Prometheus:
                  mlforecast_func: Callable, screener_func: Callable,
                  powerscore_func: Callable, sentiment_func: Callable,
                  fundamentals_func: Callable, quickscore_func: Callable):
-        # (Init remains the same)
         prometheus_logger.info("Initializing Prometheus Core...")
         self.db_path = "prometheus_kb.sqlite"; self._initialize_db(); self.toolbox = toolbox_map
         self.risk_command_func = risk_command_func; self.derivative_func = derivative_func; self.mlforecast_func = mlforecast_func
@@ -161,30 +181,187 @@ class Prometheus:
         self.fundamentals_func = fundamentals_func; self.quickscore_func = quickscore_func
         self.gemini_model = None; self.gemini_api_key = gemini_api_key; self.synthesized_commands = set()
         if gemini_api_key and "AIza" in gemini_api_key:
-             try: genai.configure(api_key=gemini_api_key); self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-lite'); prometheus_logger.info("Gemini model OK."); print("   -> Prometheus Core: Gemini model initialized.")
+             try:
+                 genai.configure(api_key=gemini_api_key)
+                 # --- CORRECTED MODEL NAME ---
+                 self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-lite')
+                 prometheus_logger.info("Gemini model OK."); print("   -> Prometheus Core: Gemini model initialized.")
              except Exception as e: prometheus_logger.error(f"Gemini init failed: {e}"); print(f"   -> Prometheus Core: Warn - Gemini init failed: {e}")
         else: prometheus_logger.warning("Gemini API key missing/invalid."); print("   -> Prometheus Core: Warn - Gemini API key missing/invalid.")
+
         self._load_and_register_synthesized_commands_sync()
-        required_funcs = [self.derivative_func, self.mlforecast_func, self.powerscore_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func]
+        self._load_optimizable_params()
+
+        required_funcs = [self.derivative_func, self.mlforecast_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func] # Removed powerscore temporarily
         if all(required_funcs): self.correlation_task = asyncio.create_task(self.background_correlation_analysis()); prometheus_logger.info("BG correlation task started."); print("   -> Prometheus Core: Background correlation task started.")
-        else: missing = [f.__name__ for f, func in zip(["deriv", "mlfcst", "pwsc", "sent", "fund", "qscore"], required_funcs) if not func]; self.correlation_task = None; prometheus_logger.warning(f"BG correlation task NOT started (missing: {', '.join(missing)})."); print(f"   -> Prometheus Core: BG correlation task NOT started (missing: {', '.join(missing)}).")
+        else: missing = [f.__name__ for f, func in zip(["deriv", "mlfcst", "sent", "fund", "qscore"], required_funcs) if not func]; self.correlation_task = None; prometheus_logger.warning(f"BG correlation task NOT started (missing: {', '.join(missing)})."); print(f"   -> Prometheus Core: BG correlation task NOT started (missing: {', '.join(missing)}).")
+        os.makedirs(IMPROVED_CODE_DIR, exist_ok=True)
 
     def _initialize_db(self):
-        # (Keep existing implementation)
+        # ... (implementation remains the same, including backtest columns) ...
         prometheus_logger.info(f"Initializing KB (SQLite) at '{self.db_path}'...")
         print("   -> Prometheus Core: Initializing Knowledge Base (SQLite)...")
         try:
             conn = sqlite3.connect(self.db_path); cursor = conn.cursor()
-            cursor.execute("""CREATE TABLE IF NOT EXISTS command_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, command TEXT NOT NULL, parameters TEXT, market_context TEXT, output_summary TEXT, success BOOLEAN, duration_ms INTEGER, user_feedback_rating INTEGER, user_feedback_comment TEXT)""")
+            cursor.execute("""CREATE TABLE IF NOT EXISTS command_log (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                timestamp TEXT NOT NULL,
+                                command TEXT NOT NULL,
+                                parameters TEXT,
+                                market_context TEXT,
+                                output_summary TEXT,
+                                success BOOLEAN,
+                                duration_ms INTEGER,
+                                user_feedback_rating INTEGER,
+                                user_feedback_comment TEXT,
+                                backtest_return_pct REAL,
+                                backtest_sharpe_ratio REAL,
+                                backtest_trade_count INTEGER
+                             )""")
             cursor.execute("PRAGMA table_info(command_log)"); columns = [info[1] for info in cursor.fetchall()]
             if 'user_feedback_rating' not in columns: cursor.execute("ALTER TABLE command_log ADD COLUMN user_feedback_rating INTEGER")
             if 'user_feedback_comment' not in columns: cursor.execute("ALTER TABLE command_log ADD COLUMN user_feedback_comment TEXT")
-            conn.commit(); conn.close(); prometheus_logger.info("KB schema verified."); print("   -> Prometheus Core: Knowledge Base ready.")
-        # --- MODIFICATION: Removed emoji ---
+            if 'backtest_return_pct' not in columns: cursor.execute("ALTER TABLE command_log ADD COLUMN backtest_return_pct REAL")
+            if 'backtest_sharpe_ratio' not in columns: cursor.execute("ALTER TABLE command_log ADD COLUMN backtest_sharpe_ratio REAL")
+            if 'backtest_trade_count' not in columns: cursor.execute("ALTER TABLE command_log ADD COLUMN backtest_trade_count INTEGER")
+
+            conn.commit(); conn.close(); prometheus_logger.info("KB schema verified (incl. backtest columns)."); print("   -> Prometheus Core: Knowledge Base ready.")
         except Exception as e: prometheus_logger.exception(f"ERROR initializing DB: {e}"); print(f"   -> Prometheus Core: [ERROR] initializing DB: {e}")
 
+    # --- NEW: Load Optimizable Parameters Config ---
+    def _load_optimizable_params(self):
+        """Loads the optimizable parameter definitions from JSON file."""
+        self.optimizable_params_config = {}
+        default_config = {
+            "/backtest": {
+                "ma_crossover": {
+                    "short_ma": {"type": "int", "min": 5, "max": 100, "step": 1},
+                    "long_ma": {"type": "int", "min": 20, "max": 250, "step": 1}
+                },
+                "rsi": {
+                    "rsi_period": {"type": "int", "min": 5, "max": 30, "step": 1},
+                    "rsi_buy": {"type": "int", "min": 10, "max": 40, "step": 1},
+                    "rsi_sell": {"type": "int", "min": 60, "max": 90, "step": 1}
+                },
+                 "trend_following": {
+                     "ema_short": {"type": "int", "min": 5, "max": 50, "step": 1},
+                     "ema_long": {"type": "int", "min": 20, "max": 150, "step": 1},
+                     "adx_thresh": {"type": "int", "min": 15, "max": 40, "step": 1}
+                 }
+                # Add other backtest strategies here
+            },
+            "/invest": { # Example for /invest if it becomes optimizable
+                "_default": { # Use _default if no specific sub-strategy
+                    "amplification": {"type": "float", "min": 0.1, "max": 5.0, "step": 0.1}
+                    # "ema_sensitivity": {"type": "int", "values": [1, 2, 3]} # Example with specific values
+                }
+            }
+        }
+        try:
+            if not os.path.exists(OPTIMIZABLE_PARAMS_FILE):
+                 prometheus_logger.warning(f"Optimizable params file '{OPTIMIZABLE_PARAMS_FILE}' not found. Creating with defaults.")
+                 with open(OPTIMIZABLE_PARAMS_FILE, 'w') as f:
+                     json.dump(default_config, f, indent=4)
+                 self.optimizable_params_config = default_config
+            else:
+                with open(OPTIMIZABLE_PARAMS_FILE, 'r') as f:
+                    self.optimizable_params_config = json.load(f)
+                prometheus_logger.info(f"Loaded optimizable parameters from '{OPTIMIZABLE_PARAMS_FILE}'.")
+        except (IOError, json.JSONDecodeError) as e:
+            prometheus_logger.error(f"Error loading or creating optimizable params file: {e}. Using empty config.")
+            self.optimizable_params_config = {} # Use empty on error
+
+    # --- NEW: Get Optimizable Parameters ---
+    def _get_optimizable_params(self, command_name: str, strategy_name: Optional[str] = None) -> Optional[Dict[str, Dict]]:
+        """Retrieves the parameter definitions for a specific command/strategy."""
+        command_config = self.optimizable_params_config.get(command_name)
+        if not command_config:
+            return None
+        if strategy_name:
+            return command_config.get(strategy_name)
+        else:
+            # Return default if only one strategy or a _default key exists
+            if len(command_config) == 1:
+                return next(iter(command_config.values()))
+            return command_config.get("_default")
+
+    # --- NEW: Generate Initial Population ---
+    def _generate_initial_population(self, command_name: str, strategy_name: Optional[str] = None, population_size: int = 50) -> List[Dict[str, Any]]:
+        """Generates a list of random parameter sets (individuals)."""
+        param_definitions = self._get_optimizable_params(command_name, strategy_name)
+        if not param_definitions:
+            prometheus_logger.error(f"Cannot generate population: No optimizable parameter definitions found for {command_name}/{strategy_name or ''}")
+            return []
+
+        population = []
+        for _ in range(population_size):
+            individual = {}
+            for param, definition in param_definitions.items():
+                param_type = definition.get("type")
+                if "values" in definition:
+                    individual[param] = random.choice(definition["values"])
+                elif param_type == "int":
+                    step = definition.get("step", 1)
+                    min_val = definition.get("min")
+                    max_val = definition.get("max")
+                    if min_val is not None and max_val is not None:
+                        # Ensure range includes max_val and aligns with step
+                        num_steps = (max_val - min_val) // step
+                        individual[param] = min_val + random.randint(0, num_steps) * step
+                    else:
+                         individual[param] = random.randint(0, 100) # Fallback range
+                elif param_type == "float":
+                    step = definition.get("step", 0.1)
+                    min_val = definition.get("min")
+                    max_val = definition.get("max")
+                    if min_val is not None and max_val is not None:
+                         val = random.uniform(min_val, max_val)
+                         # Round to nearest step
+                         individual[param] = round(round(val / step) * step, 8) # Round to avoid float precision issues
+                    else:
+                         individual[param] = round(random.uniform(0.0, 1.0), 4) # Fallback range
+                else:
+                    prometheus_logger.warning(f"Unsupported parameter type '{param_type}' for '{param}' in config.")
+            population.append(individual)
+
+        prometheus_logger.info(f"Generated initial population of size {len(population)} for {command_name}/{strategy_name or ''}.")
+        return population
+    # --- END NEW GA FUNCTIONS ---
+
+
+    def read_command_code(self, command_filename: str) -> Optional[str]:
+        # ... (implementation remains the same) ...
+        if not command_filename.endswith(".py"):
+            prometheus_logger.error(f"read_command_code: Invalid filename '{command_filename}'. Must end with .py")
+            return None
+        current_dir = os.path.dirname(__file__)
+        commands_subfolder = COMMANDS_DIR
+        file_path = os.path.join(current_dir, commands_subfolder, command_filename)
+        prometheus_logger.debug(f"Attempting to read code from specific path: {file_path}")
+        try:
+            if not os.path.exists(file_path):
+                prometheus_logger.error(f"read_command_code: File not found at specific path '{file_path}'")
+                fallback_path = os.path.join(current_dir, command_filename)
+                prometheus_logger.debug(f"Attempting fallback read from: {fallback_path}")
+                if os.path.exists(fallback_path):
+                    file_path = fallback_path
+                    prometheus_logger.info(f"Found code file in fallback location: {file_path}")
+                else:
+                    prometheus_logger.error(f"read_command_code: File not found in fallback either: '{fallback_path}'")
+                    return None
+            with open(file_path, 'r', encoding='utf-8') as f:
+                code_content = f.read()
+                prometheus_logger.info(f"Successfully read code from '{file_path}'")
+                return code_content
+        except IOError as e:
+            prometheus_logger.exception(f"read_command_code: IOError reading file '{file_path}': {e}")
+            return None
+        except Exception as e:
+            prometheus_logger.exception(f"read_command_code: Unexpected error reading file '{file_path}': {e}")
+            return None
+
     def _load_and_register_synthesized_commands_sync(self):
-        # (Keep existing implementation)
+        # ... (implementation remains the same) ...
         prometheus_logger.info(f"Loading synthesized commands sync from '{SYNTHESIZED_WORKFLOWS_FILE}'...")
         print(f"   -> Prometheus Core: Loading synthesized workflows...")
         loaded_count = 0
@@ -202,48 +379,55 @@ class Prometheus:
             prometheus_logger.info(f"Loaded/registered {loaded_count} synthesized commands sync.")
             print(f"   -> Prometheus Core: Loaded {loaded_count} synthesized workflows.")
         except FileNotFoundError: pass
-        # --- MODIFICATION: Removed emoji ---
         except json.JSONDecodeError: prometheus_logger.error(f"Error decoding JSON {SYNTHESIZED_WORKFLOWS_FILE}."); print(f"   -> Prometheus Core: [ERROR] Bad JSON in workflows file.")
         except Exception as e: prometheus_logger.exception(f"Error loading synthesized workflows sync: {e}"); print(f"   -> Prometheus Core: [ERROR] loading workflows sync: {e}")
 
-    # --- UPDATED: get_market_context with more DEBUG logging ---
     async def get_market_context(self) -> Dict[str, Any]:
-        # ... (get_market_context remains the same) ...
+        # ... (implementation remains the same) ...
         """ Fetches market context including risk scores and % changes with enhanced logging. """
         prometheus_logger.info("Starting context fetch...")
         print("[CONTEXT DEBUG] Starting context fetch...") # <<< DEBUG
         context: Dict[str, Any] = {"vix_price": "N/A", "spy_score": "N/A", "spy_changes": {}, "vix_changes": {}}
         risk_fetch_success = False
 
-        # --- Try Risk Command ---
         if self.risk_command_func:
-            original_stdout = sys.stdout; sys.stdout = io.StringIO() # Suppress command output
+            original_stdout = sys.stdout; sys.stdout = io.StringIO()
             try:
                 prometheus_logger.debug("Attempting primary context fetch via risk_command_func...")
                 print("[CONTEXT DEBUG] Calling risk_command_func...") # <<< DEBUG
-                # --- Increased timeout ---
                 risk_result_tuple_or_dict = await asyncio.wait_for(
                      self.risk_command_func(args=[], ai_params={"assessment_type": "standard"}, is_called_by_ai=True),
-                     timeout=90.0 # <<< Increased timeout to 90s
+                     timeout=90.0
                 )
-                prometheus_logger.debug(f"risk_command_func raw result: {risk_result_tuple_or_dict}")
-                print(f"[CONTEXT DEBUG] risk_command_func result type: {type(risk_result_tuple_or_dict)}") # <<< DEBUG
+                prometheus_logger.debug(f"risk_command_func raw result type: {type(risk_result_tuple_or_dict)}") # <<< DEBUG
                 risk_data_dict = {}; raw_data_dict = {}
-                if isinstance(risk_result_tuple_or_dict, dict): risk_data_dict = risk_result_tuple_or_dict
-                elif isinstance(risk_result_tuple_or_dict, tuple) and len(risk_result_tuple_or_dict) >= 2: risk_data_dict = risk_result_tuple_or_dict[0] if isinstance(risk_result_tuple_or_dict[0], dict) else {}; raw_data_dict = risk_result_tuple_or_dict[1] if isinstance(risk_result_tuple_or_dict[1], dict) else {}
+                if isinstance(risk_result_tuple_or_dict, tuple) and len(risk_result_tuple_or_dict) >= 2:
+                    risk_data_dict = risk_result_tuple_or_dict[0] if isinstance(risk_result_tuple_or_dict[0], dict) else {}
+                    raw_data_dict = risk_result_tuple_or_dict[1] if isinstance(risk_result_tuple_or_dict[1], dict) else {}
+                elif isinstance(risk_result_tuple_or_dict, dict):
+                    risk_data_dict = risk_result_tuple_or_dict
+                    raw_data_dict["Live VIX Price"] = risk_data_dict.get('vix_price')
+                    raw_data_dict["Raw Market Invest Score"] = risk_data_dict.get('market_invest_score') # Might be capped
                 elif risk_result_tuple_or_dict is None: prometheus_logger.warning("Risk command returned None.")
                 elif isinstance(risk_result_tuple_or_dict, str) and "error" in risk_result_tuple_or_dict.lower(): prometheus_logger.warning(f"Risk error: {risk_result_tuple_or_dict}")
-                else: prometheus_logger.warning(f"Unexpected risk result: {type(risk_result_tuple_or_dict)}")
+                else: prometheus_logger.warning(f"Unexpected risk result type: {type(risk_result_tuple_or_dict)}")
 
-                # Try extracting VIX and Score more robustly
-                vix_str = raw_data_dict.get("Live VIX Price") # Check raw dict first
-                score_str = risk_data_dict.get(next((k for k in risk_data_dict if 'market invest score' in k.lower()), None))
-                if vix_str is None: # Fallback to parsed dict
-                    vix_key = next((k for k in risk_data_dict if 'vix price' in k.lower()), None)
+                vix_str = raw_data_dict.get("Live VIX Price")
+                if vix_str in ["N/A", None, ""]:
+                    vix_key = next((k for k in risk_data_dict if 'vix' in k.lower() and 'price' in k.lower()), None)
                     vix_str = risk_data_dict.get(vix_key)
 
-                if vix_str not in ["N/A", None, ""]: context["vix_price"] = str(vix_str).strip().replace('%','')
-                if score_str not in ["N/A", None, ""]: context["spy_score"] = str(score_str).strip().replace('%','')
+                score_str = raw_data_dict.get("Raw Market Invest Score")
+                if score_str in ["N/A", None, ""]:
+                    score_key = next((k for k in risk_data_dict if 'market invest score' in k.lower()), None)
+                    score_str = risk_data_dict.get(score_key)
+
+                if vix_str not in ["N/A", None, ""]:
+                    try: context["vix_price"] = f"{float(str(vix_str).strip('%').strip()):.2f}"
+                    except (ValueError, TypeError): pass
+                if score_str not in ["N/A", None, ""]:
+                    try: context["spy_score"] = f"{float(str(score_str).strip('%').strip()):.2f}%"
+                    except (ValueError, TypeError): pass
 
                 if context["vix_price"] != "N/A" and context["spy_score"] != "N/A":
                     risk_fetch_success = True
@@ -254,22 +438,21 @@ class Prometheus:
                     print(f"[CONTEXT DEBUG] Primary risk fetch partial/failed: VIX={context['vix_price']}, Score={context['spy_score']}")
             except asyncio.TimeoutError:
                 prometheus_logger.error("Primary risk context fetch timed out (90s)")
-                print("[CONTEXT DEBUG] Primary risk context fetch timed out (90s)") # <<< DEBUG Timeout
+                print("[CONTEXT DEBUG] Primary risk context fetch timed out (90s)")
             except Exception as e:
                 prometheus_logger.exception(f"Primary risk context fetch error: {e}")
-                print(f"[CONTEXT DEBUG] Primary risk context fetch error: {type(e).__name__} - {e}") # <<< DEBUG Error
+                print(f"[CONTEXT DEBUG] Primary risk context fetch error: {type(e).__name__} - {e}")
             finally:
-                sys.stdout = original_stdout # Restore stdout
+                sys.stdout = original_stdout
         else:
             prometheus_logger.warning("No risk_command_func provided for context.")
-            print("[CONTEXT DEBUG] No risk_command_func provided.") # <<< DEBUG
+            print("[CONTEXT DEBUG] No risk_command_func provided.")
 
-        # --- Fallback SPY Score ---
         if context["spy_score"] == "N/A":
             prometheus_logger.info("Attempting fallback SPY INVEST score...")
-            print("[CONTEXT DEBUG] Attempting fallback SPY INVEST score...") # <<< DEBUG
+            print("[CONTEXT DEBUG] Attempting fallback SPY INVEST score...")
             try:
-                spy_invest_score = await asyncio.wait_for(calculate_ema_invest_minimal('SPY', 2), timeout=30.0) # <<< Increased timeout
+                spy_invest_score = await asyncio.wait_for(calculate_ema_invest_minimal('SPY', 2), timeout=30.0)
                 if spy_invest_score is not None:
                     context["spy_score"] = f"{spy_invest_score:.2f}%"
                     prometheus_logger.info(f"Fallback SPY Score OK: {context['spy_score']}")
@@ -279,27 +462,22 @@ class Prometheus:
                     print("[CONTEXT DEBUG] Fallback SPY Score failed (returned None).")
             except asyncio.TimeoutError:
                 prometheus_logger.error("Fallback SPY Score timed out (30s).")
-                print("[CONTEXT DEBUG] Fallback SPY Score timed out (30s).") # <<< DEBUG Timeout
+                print("[CONTEXT DEBUG] Fallback SPY Score timed out (30s).")
             except Exception as e_spy:
                 prometheus_logger.exception(f"Fallback SPY Score error: {e_spy}")
-                print(f"[CONTEXT DEBUG] Fallback SPY Score error: {type(e_spy).__name__} - {e_spy}") # <<< DEBUG Error
+                print(f"[CONTEXT DEBUG] Fallback SPY Score error: {type(e_spy).__name__} - {e_spy}")
 
-        # --- Fallback VIX Price ---
         if context["vix_price"] == "N/A":
             prometheus_logger.info("Attempting fallback VIX price fetch...")
-            print("[CONTEXT DEBUG] Attempting fallback VIX price fetch...") # <<< DEBUG
+            print("[CONTEXT DEBUG] Attempting fallback VIX price fetch...")
             try:
-                # <<< Use auto_adjust=False for VIX fallback to get raw price easier >>>
-                vix_data = await asyncio.wait_for(get_yf_download_robustly(tickers=['^VIX'], period="5d", interval="1d", auto_adjust=False), timeout=30.0) # <<< Increased timeout
+                vix_data = await asyncio.wait_for(get_yf_download_robustly(tickers=['^VIX'], period="5d", interval="1d", auto_adjust=False), timeout=30.0)
                 prometheus_logger.debug(f"Fallback VIX yf download result (shape): {vix_data.shape if not vix_data.empty else 'Empty'}")
                 if not vix_data.empty:
                     close_prices = None; ticker = '^VIX'; price_level_name = 'Price'; close_col_tuple = None
-                    # (Robust close price extraction - Added Debug Logs)
                     if isinstance(vix_data.columns, pd.MultiIndex):
                          prometheus_logger.debug("Fallback VIX: MultiIndex detected")
-                         # Try Price/Ticker levels first (standardized)
                          if ('Close', ticker) in vix_data.columns: close_prices = vix_data[('Close', ticker)]; prometheus_logger.debug("Fallback VIX: Found ('Close', ticker)")
-                         # Fallback if names are different but structure might be Price/Ticker
                          elif 'Close' in vix_data.columns.get_level_values(0):
                              close_col_tuple = next((c for c in vix_data.columns if c[0] == 'Close'), None);
                              if close_col_tuple: close_prices = vix_data[close_col_tuple]; prometheus_logger.debug(f"Fallback VIX: Found tuple {close_col_tuple}")
@@ -316,13 +494,11 @@ class Prometheus:
                 else: prometheus_logger.warning("Fallback VIX: Empty data returned from yfinance."); print("[CONTEXT DEBUG] Fallback VIX: Empty data returned from yfinance.")
             except asyncio.TimeoutError:
                 prometheus_logger.error("Fallback VIX price timed out (30s).")
-                print("[CONTEXT DEBUG] Fallback VIX price timed out (30s).") # <<< DEBUG Timeout
+                print("[CONTEXT DEBUG] Fallback VIX price timed out (30s).")
             except Exception as e_vix:
                 prometheus_logger.exception(f"Fallback VIX price fetch error: {e_vix}")
-                print(f"[CONTEXT DEBUG] Fallback VIX price fetch error: {type(e_vix).__name__} - {e_vix}") # <<< DEBUG Error
+                print(f"[CONTEXT DEBUG] Fallback VIX price fetch error: {type(e_vix).__name__} - {e_vix}")
 
-        # --- Percentage Changes ---
-        # (Keep as is)
         try:
              spy_changes_task = asyncio.wait_for(_calculate_perc_changes('SPY'), timeout=30.0); vix_changes_task = asyncio.wait_for(_calculate_perc_changes('^VIX'), timeout=30.0)
              spy_changes_result, vix_changes_result = await asyncio.gather(spy_changes_task, vix_changes_task, return_exceptions=True)
@@ -336,11 +512,9 @@ class Prometheus:
         prometheus_logger.info(f"Final market context: VIX={context['vix_price']}, Score={context['spy_score']}")
         print(f"[CONTEXT DEBUG] Final context: VIX={context['vix_price']}, Score={context['spy_score']}")
         return context
-    # --- END: get_market_context ---
 
-    # --- UPDATED: execute_and_log fixes arg passing and None return ---
     async def execute_and_log(self, command_name_with_slash: str, args: List[str] = None, ai_params: Optional[Dict] = None, called_by_user: bool = False, internal_call: bool = False) -> Any:
-        # ... (execute_and_log remains largely the same, ensure the `kwargs_to_pass` for memo and strategy_recipe are correct) ...
+        # ... (implementation remains the same, including backtest metric extraction) ...
         start_time = datetime.now(); command_name = command_name_with_slash.lstrip('/'); context = {}
         if not internal_call: context = await self.get_market_context()
         command_func = self.toolbox.get(command_name); log_id = None
@@ -357,6 +531,8 @@ class Prometheus:
         is_synthesis_execution = command_name.startswith("synthesized_")
         if called_by_user or is_synthesis_execution: print(f"[Prometheus Log] {log_msg_start}")
         output_summary = f"Execution started."; success_flag = False; result = None
+        backtest_metrics_for_log = {} # <-- Initialize dict for backtest metrics
+
         try:
             kwargs_to_pass = {}
             sig = inspect.signature(command_func)
@@ -364,7 +540,6 @@ class Prometheus:
             expects_args = 'args' in func_params
             expects_ai_params = 'ai_params' in func_params
 
-            # --- *** Argument Logic *** ---
             if expects_args:
                 kwargs_to_pass["args"] = args if called_by_user and args is not None else []
             if expects_ai_params:
@@ -372,49 +547,61 @@ class Prometheus:
             if 'is_called_by_ai' in func_params:
                 kwargs_to_pass["is_called_by_ai"] = not called_by_user
 
-            # (Dependency injection for AI models, locks, etc.)
-            if "gemini_model_obj" in func_params and command_name in ["dev", "report", "compare", "powerscore", "sentiment", "reportgeneration", "memo", "strategy_recipe"]: # <<< Added strategy_recipe
+            # --- Inject dependencies based on function signature ---
+            if "gemini_model_obj" in func_params and command_name in ["dev", "report", "compare", "sentiment", "reportgeneration", "memo", "strategy_recipe", "generate_improvement_hypothesis", "_generate_improved_code"]: # Added _generate_improved_code
                  kwargs_to_pass["gemini_model_obj"] = self.gemini_model
-            if "api_lock_override" in func_params and command_name in ["powerscore", "sentiment"]:
+            if "api_lock_override" in func_params and command_name in ["sentiment"]: # Removed powerscore
                  try: from main_singularity import GEMINI_API_LOCK; kwargs_to_pass["api_lock_override"] = GEMINI_API_LOCK
                  except ImportError: prometheus_logger.warning(f"Could not import GEMINI_API_LOCK for {command_name}")
             if "screener_func" in func_params and command_name == "dev": kwargs_to_pass["screener_func"] = self.screener_func
             if command_name == "reportgeneration" and "available_functions" in func_params : kwargs_to_pass["available_functions"] = self.toolbox
-            # --- Pass Prometheus instance to memo and strategy_recipe commands ---
-            if command_name in ["memo", "strategy_recipe"] and "prometheus_instance" in func_params:
+            if command_name in ["memo", "strategy_recipe", "generate_improvement_hypothesis", "_generate_improved_code"] and "prometheus_instance" in func_params: # Added _generate_improved_code
                 kwargs_to_pass["prometheus_instance"] = self
+            if 'called_by_user' in func_params and command_name in ["strategy_recipe"]:
+                kwargs_to_pass["called_by_user"] = called_by_user
 
-            prometheus_logger.debug(f"Calling {command_name} with actual kwargs: {kwargs_to_pass}")
+            prometheus_logger.debug(f"Calling {command_name} with actual kwargs: {list(kwargs_to_pass.keys())}") # Log only keys
             if asyncio.iscoroutinefunction(command_func): result = await command_func(**kwargs_to_pass)
             else: result = await asyncio.to_thread(lambda: command_func(**kwargs_to_pass))
             prometheus_logger.debug(f"Result from {command_name}: {type(result)} - {str(result)[:100]}...")
             success_flag = True
+
             # --- Result Summarization Logic ---
-            # ... (keep existing summarization, add cases for memo and strategy_recipe) ...
             if result is None: output_summary = f"{command_name_with_slash} completed (printed output or None)."
             elif isinstance(result, str):
                  if "error" in result.lower() or "failed" in result.lower(): success_flag = False
                  output_summary = result[:1000]
             elif isinstance(result, dict):
-                 if result.get('status') == 'error' or 'error' in result: success_flag = False; output_summary = str(result.get('error') or result.get('message', 'Unknown error dict'))[:1000]
+                 # --- Extract backtest metrics if command was /backtest ---
+                 if command_name == "backtest" and result.get("status") == "success":
+                     backtest_metrics_for_log = {
+                         "backtest_return_pct": result.get("total_return_pct"),
+                         "backtest_sharpe_ratio": result.get("sharpe_ratio"),
+                         "backtest_trade_count": result.get("trade_count")
+                     }
+                     output_summary = (f"Backtest success: Return={result.get('total_return_pct', 'N/A'):.2f}%, "
+                                       f"Sharpe={result.get('sharpe_ratio', 'N/A'):.3f}, Trades={result.get('trade_count', 'N/A')}")
+                     if result.get('status') == 'error': success_flag = False # Should not happen if status=success
+                 # --- END BACKTEST HANDLING ---
+                 elif result.get('status') == 'error' or 'error' in result: success_flag = False; output_summary = str(result.get('error') or result.get('message', 'Unknown error dict'))[:1000]
                  elif result.get('status') == 'success' or result.get('status') == 'partial_error':
-                     # ... (Keep specific summary logic) ...
-                     if command_name == "powerscore" and 'powerscore' in result: output_summary = f"PowerScore for {result.get('ticker','N/A')} (S{result.get('sensitivity','?')}) = {result['powerscore']:.2f}. Errors: {result.get('errors')}"
-                     elif command_name == "sentiment" and 'sentiment_score_raw' in result: output_summary = f"Sentiment for {result.get('ticker','N/A')}: Score={result['sentiment_score_raw']:.2f}. Summary: {result.get('summary', 'N/A')}"
+                     # ... (rest of dict summarization logic remains) ...
+                     if command_name == "sentiment" and 'sentiment_score_raw' in result: output_summary = f"Sentiment for {result.get('ticker','N/A')}: Score={result['sentiment_score_raw']:.2f}. Summary: {result.get('summary', 'N/A')}"
                      elif command_name == "fundamentals" and 'fundamental_score' in result: output_summary = f"Fundamentals Score for {result.get('ticker','N/A')}: {result['fundamental_score']:.2f}"
                      elif command_name == "risk": output_summary = f"Risk: Combined={result.get('combined_score', 'N/A')}, MktInv={result.get('market_invest_score', 'N/A')}, IVR={result.get('market_ivr', 'N/A')}"
                      elif command_name == "breakout" and 'current_breakout_stocks' in result: stocks = result['current_breakout_stocks']; count = len(stocks); top_ticker = stocks[0]['Ticker'] if count > 0 else 'None'; output_summary = f"Breakout: Found {count} stocks. Top: {top_ticker}."
                      elif command_name == "reportgeneration" and 'filename' in result: output_summary = f"Report Generation: Success. File '{result['filename']}'."
                      elif command_name == "derivative" and 'summary' in result: output_summary = result['summary'][:1000]
-                     elif command_name == "quickscore": output_summary = result.get("summary", result.get("message", str(result)))[:1000] # Check dict first
+                     elif command_name == "quickscore": output_summary = result.get("summary", result.get("message", str(result)))[:1000]
                      elif command_name.startswith("synthesized_") and 'summary' in result: output_summary = result['summary'][:1000]
                      elif command_name == "memo" and 'memo_text' in result: output_summary = "Market Memo generated successfully."
-                     elif command_name == "strategy_recipe" and 'recipe_steps' in result: output_summary = f"Strategy Recipe generated ({len(result['recipe_steps'])} steps)." # <<< Summary for recipe
+                     elif command_name == "strategy_recipe" and 'recipe_steps' in result: output_summary = f"Strategy Recipe generated ({len(result['recipe_steps'])} steps)."
+                     elif command_name == "generate_improvement_hypothesis" and 'hypothesis' in result: output_summary = f"Hypothesis generated for {result.get('filename','?')}"
+                     elif command_name == "_generate_improved_code" and 'filepath' in result: output_summary = f"Generated improved code saved to {result.get('filepath')}" # Fixed .get()
                      elif 'summary' in result: output_summary = str(result['summary'])[:1000]
                      elif 'message' in result: output_summary = str(result['message'])[:1000]
                      else: output_summary = f"{command_name_with_slash} success (dict)."
                  else: output_summary = f"{command_name_with_slash} completed (dict)."
-            # ... (keep handling for tuple, list, DataFrame etc.) ...
             elif isinstance(result, tuple):
                  if command_name in ["invest", "cultivate"] and len(result) >= 4:
                      holdings_data = result[3] if len(result[3]) > 0 else result[1]; num_holdings = len(holdings_data) if isinstance(holdings_data, list) else 0; cash_val = result[2]
@@ -433,36 +620,64 @@ class Prometheus:
              result = {"status": "error", "message": output_summary}
         finally:
              duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-             if not internal_call or is_synthesis_execution:
-                 log_id = self._log_command(start_time, command_name_with_slash, parameters_to_log, context, output_summary[:5000], success=success_flag, duration_ms=duration_ms)
+             log_internal_ai_steps = command_name in ["generate_improvement_hypothesis", "_generate_improved_code"]
+             if not internal_call or is_synthesis_execution or log_internal_ai_steps:
+                 log_id = self._log_command(
+                     start_time, command_name_with_slash, parameters_to_log, context,
+                     output_summary[:5000], success=success_flag, duration_ms=duration_ms,
+                     backtest_metrics=backtest_metrics_for_log # Pass the dict here
+                 )
                  if called_by_user and log_id is not None: print(f"[Prometheus Action ID: {log_id}]")
                  if success_flag and called_by_user and not internal_call and not is_synthesis_execution and random.random() < 0.1:
                      await self.analyze_workflows()
 
-        if result is None and success_flag: return {"status": "success", "summary": output_summary}
+        # --- Return adjusted result for backtest ---
+        if command_name == "backtest" and isinstance(result, dict) and result.get("status") == "success":
+            return result # Return the full dict from backtest command
+        elif result is None and success_flag:
+             return {"status": "success", "summary": output_summary}
         return result
-    # --- END execute_and_log ---
 
-    def _log_command(self, timestamp: datetime, command: str, parameters: Any, context: Dict[str, Any], output_summary: str, success: bool = True, duration_ms: int = 0) -> Optional[int]:
-        # (Keep existing implementation)
+    def _log_command(self, timestamp: datetime, command: str, parameters: Any, context: Dict[str, Any], output_summary: str, success: bool = True, duration_ms: int = 0, backtest_metrics: Optional[Dict] = None) -> Optional[int]:
+        # ... (implementation remains the same) ...
         params_str = json.dumps(parameters, default=str) if isinstance(parameters, (dict, list)) else str(parameters); context_str = json.dumps(context, default=str)
-        log_entry = { "timestamp": timestamp.isoformat(), "command": command, "parameters": params_str, "market_context": context_str, "output_summary": output_summary, "success": success, "duration_ms": duration_ms };
-        log_msg = f"Logging: {command} | Success: {success} | Duration: {duration_ms}ms | Summary: {output_summary[:60]}..."; prometheus_logger.info(log_msg)
+        log_entry = {
+            "timestamp": timestamp.isoformat(), "command": command, "parameters": params_str,
+            "market_context": context_str, "output_summary": output_summary, "success": success,
+            "duration_ms": duration_ms
+        }
+        if backtest_metrics:
+            log_entry["backtest_return_pct"] = backtest_metrics.get("backtest_return_pct")
+            log_entry["backtest_sharpe_ratio"] = backtest_metrics.get("backtest_sharpe_ratio")
+            log_entry["backtest_trade_count"] = backtest_metrics.get("backtest_trade_count")
+
+        log_msg = f"Logging: {command} | Success: {success} | Duration: {duration_ms}ms | Summary: {output_summary[:60]}...";
+        if backtest_metrics: log_msg += f" | BT Return: {log_entry['backtest_return_pct']:.2f}%" if log_entry.get('backtest_return_pct') is not None else ""
+        prometheus_logger.info(log_msg)
+
         conn = None
         try:
             conn = sqlite3.connect(self.db_path); cursor = conn.cursor()
-            cursor.execute("""INSERT INTO command_log (timestamp, command, parameters, market_context, output_summary, success, duration_ms) VALUES (:timestamp, :command, :parameters, :market_context, :output_summary, :success, :duration_ms)""", log_entry)
+            columns = ', '.join(log_entry.keys())
+            placeholders = ', '.join(':' + key for key in log_entry.keys())
+            sql = f"INSERT INTO command_log ({columns}) VALUES ({placeholders})"
+            cursor.execute(sql, log_entry)
             conn.commit(); last_id = cursor.lastrowid; conn.close()
             return last_id
-        # --- MODIFICATION: Removed emoji ---
+        except sqlite3.Error as e:
+            prometheus_logger.exception(f"ERROR logging command to DB: {e} | SQL: {sql} | Data: {log_entry}")
+            print(f"   -> Prometheus Core: [ERROR] logging command to DB: {e}")
+            if conn: conn.close()
+            return None
         except Exception as e:
-            prometheus_logger.exception(f"ERROR logging command to DB: {e}"); print(f"   -> Prometheus Core: [ERROR] logging command to DB: {e}")
+            prometheus_logger.exception(f"Unexpected ERROR logging command to DB: {e} | Data: {log_entry}")
+            print(f"   -> Prometheus Core: [UNEXPECTED ERROR] logging command: {e}")
             if conn: conn.close()
             return None
 
-    # --- UPDATED: analyze_workflows for 2-step sequences ---
+    # ... (Rest of Prometheus class methods: analyze_workflows, _create_*, _save_*, background_*, generate_*, _generate_*, _compare_*, _load_*, _run_*, _parse_*, start_interactive_session, _query_log_db remain the same) ...
     async def analyze_workflows(self):
-        # ... (analyze_workflows remains the same) ...
+        # ... (implementation remains the same) ...
         prometheus_logger.info("Analyzing command history for potential 2-step workflows...")
         print("[Prometheus Workflow] Analyzing command history for 2-step patterns...")
         conn = sqlite3.connect(self.db_path)
@@ -480,7 +695,7 @@ class Prometheus:
                 for _, row in df_sequences.iterrows():
                     sequence = [row['command1'], row['command2']]
                     print(f"  - Sequence `{'` -> `'.join(sequence)}` observed {row['frequency']} times.")
-                    known_pattern = ['/breakout', '/quickscore'] # Target the 2-step pattern
+                    known_pattern = ['/breakout', '/quickscore']
                     if sequence == known_pattern:
                         cmd_name_with_slash = f"/synthesized_{'_'.join(s.lstrip('/') for s in sequence)}"
                         if cmd_name_with_slash not in self.synthesized_commands:
@@ -495,16 +710,13 @@ class Prometheus:
             else:
                  prometheus_logger.info("No frequent 2-step command sequences (>=2) found.")
                  print("[Prometheus Workflow] No frequent (>=2) 2-step command sequences found.")
-        # --- MODIFICATION: Removed emoji ---
         except Exception as e:
             prometheus_logger.exception(f"ERROR analyzing 2-step workflows: {e}"); print(f"[Prometheus Workflow] [ERROR] {e}")
         finally: conn.close()
-    # --- END: analyze_workflows update ---
 
 
-    # --- UPDATED: _create_and_register_workflow_function for 2 steps ---
     async def _create_and_register_workflow_function(self, sequence: List[str], command_name_with_slash: str, load_only: bool = False):
-        # ... (_create_and_register_workflow_function remains the same) ...
+        # ... (implementation remains the same) ...
         """ Internal helper for the 2-step /breakout -> /quickscore workflow. """
         prometheus_logger.info(f"{'Loading' if load_only else 'Creating'} 2-step workflow function for '{command_name_with_slash}'")
         command_name_no_slash = command_name_with_slash.lstrip('/')
@@ -513,11 +725,9 @@ class Prometheus:
         async def _workflow_executor(args: List[str], ai_params: Optional[Dict] = None, is_called_by_ai: bool = False):
             print(f"\n--- Running Synthesized Workflow: {command_name_with_slash} ---"); step_summaries = []; top_ticker = None; success = True
             print("  Step 1: Running /breakout..."); prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 1 - /breakout")
-            # --- Pass empty args list explicitly ---
             breakout_result = await self.execute_and_log("/breakout", args=[], called_by_user=False, internal_call=True)
-            prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 1 Result: {breakout_result}") # <<< DEBUG
+            prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 1 Result: {breakout_result}")
 
-            # --- Robust Breakout Result Handling ---
             if isinstance(breakout_result, dict) and breakout_result.get("status") == "success":
                 stocks = breakout_result.get("current_breakout_stocks", [])
                 if stocks and isinstance(stocks, list) and len(stocks) > 0:
@@ -530,17 +740,15 @@ class Prometheus:
                 else: step_summaries.append(breakout_result.get("message", "Breakout success, but found no stocks.")); print(f"    -> {breakout_result.get('message', '/breakout found no stocks.')}"); prometheus_logger.info(f"Workflow {command_name_with_slash}: Step 1 Info - No stocks.")
             else: error_msg = breakout_result.get("message", "Unknown error or non-dict result") if isinstance(breakout_result, dict) else str(breakout_result); step_summaries.append(f"Breakout step failed: {error_msg}"); print(f"    -> /breakout failed: {error_msg[:100]}..."); prometheus_logger.error(f"Workflow {command_name_with_slash}: Step 1 FAILED: {error_msg}"); success = False
 
-            # --- Step 2: Quickscore ---
             if success and top_ticker:
                 print(f"  Step 2: Running /quickscore for {top_ticker}..."); prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 2 - /quickscore {top_ticker}")
                 qs_params = {'ticker': top_ticker};
                 qs_result = await self.execute_and_log("/quickscore", ai_params=qs_params, called_by_user=False, internal_call=True)
-                prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 2 Result: {qs_result}") # <<< DEBUG
+                prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 2 Result: {qs_result}")
                 if isinstance(qs_result, dict) and qs_result.get("status") == "success": summary = qs_result.get("summary", "No summary.").split(". Graphs:")[0]; step_summaries.append(f"Quickscore ({top_ticker}): {summary}."); print(f"    -> {summary}."); prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 2 OK.")
                 else: error_msg = qs_result.get("message", "Failed or non-dict result") if isinstance(qs_result, dict) else str(qs_result); step_summaries.append(f"Quickscore ({top_ticker}): Failed."); print(f"    -> /quickscore failed: {error_msg[:100]}..."); prometheus_logger.warning(f"Workflow {command_name_with_slash}: Step 2 FAILED/Error: {qs_result}")
             elif success: step_summaries.append("Quickscore skipped."); print("  Step 2: Skipped /quickscore."); prometheus_logger.info(f"Workflow {command_name_with_slash}: Step 2 Skipped.")
 
-            # --- Final Summary ---
             final_summary = f"Synthesized workflow '{command_name_with_slash}' completed. Results: {' | '.join(step_summaries)}"; print(f"--- Workflow {command_name_with_slash} Finished ---"); prometheus_logger.info(f"Workflow {command_name_with_slash} Finished.")
             final_result_for_log = {"summary": final_summary, "status": "success" if success else "error"}
             return final_result_for_log
@@ -549,25 +757,21 @@ class Prometheus:
         if not load_only:
             prometheus_logger.info(f"Saving definition for '{command_name_with_slash}'")
             self._save_synthesized_command_definition(command_name_with_slash, sequence)
-            # --- MODIFICATION: Removed emoji ---
             print(f"[Prometheus Synthesis] New command '{command_name_with_slash}' created and saved.")
             print(f"   -> Try running: {command_name_with_slash}")
         else: prometheus_logger.info(f"Registered loaded command '{command_name_with_slash}'")
 
-    # --- Synchronous wrapper for loading ---
     def _create_and_register_workflow_function_sync(self, sequence: List[str], command_name_with_slash: str):
-        # ... (_create_and_register_workflow_function_sync remains the same) ...
+        # ... (implementation remains the same) ...
         """ Synchronous version for loading during initialization. """
-        # (Keep existing implementation - defines async func but registers sync)
         command_name_no_slash = command_name_with_slash.lstrip('/')
         if command_name_with_slash in self.synthesized_commands: return
         prometheus_logger.info(f"Loading workflow function sync for '{command_name_with_slash}'")
         async def _workflow_executor(args: List[str], ai_params: Optional[Dict] = None, is_called_by_ai: bool = False):
-            # (Keep the _workflow_executor logic exactly the same as in the async version, including only 2 steps)
             print(f"\n--- Running Synthesized Workflow: {command_name_with_slash} ---"); step_summaries = []; top_ticker = None; success = True
             print("  Step 1: Running /breakout..."); prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 1 - /breakout")
             breakout_result = await self.execute_and_log("/breakout", args=[], called_by_user=False, internal_call=True)
-            prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 1 Result: {breakout_result}") # <<< DEBUG
+            prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 1 Result: {breakout_result}")
             if isinstance(breakout_result, dict) and breakout_result.get("status") == "success":
                  stocks = breakout_result.get("current_breakout_stocks", [])
                  if stocks and isinstance(stocks, list) and len(stocks) > 0:
@@ -582,7 +786,7 @@ class Prometheus:
             if success and top_ticker:
                  print(f"  Step 2: Running /quickscore for {top_ticker}..."); prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 2 - /quickscore {top_ticker}")
                  qs_params = {'ticker': top_ticker}; qs_result = await self.execute_and_log("/quickscore", ai_params=qs_params, called_by_user=False, internal_call=True)
-                 prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 2 Result: {qs_result}") # <<< DEBUG
+                 prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 2 Result: {qs_result}")
                  if isinstance(qs_result, dict) and qs_result.get("status") == "success": summary = qs_result.get("summary", "No summary.").split(". Graphs:")[0]; step_summaries.append(f"Quickscore ({top_ticker}): {summary}."); print(f"    -> {summary}."); prometheus_logger.debug(f"Workflow {command_name_with_slash}: Step 2 OK.")
                  else: error_msg = qs_result.get("message", "Failed or non-dict result") if isinstance(qs_result, dict) else str(qs_result); step_summaries.append(f"Quickscore ({top_ticker}): Failed."); print(f"    -> /quickscore failed: {error_msg[:100]}..."); prometheus_logger.warning(f"Workflow {command_name_with_slash}: Step 2 FAILED/Error: {qs_result}")
             elif success: step_summaries.append("Quickscore skipped."); print("  Step 2: Skipped /quickscore."); prometheus_logger.info(f"Workflow {command_name_with_slash}: Step 2 Skipped.")
@@ -595,7 +799,7 @@ class Prometheus:
 
 
     def _save_synthesized_command_definition(self, command_name_with_slash: str, sequence: List[str]):
-        # (Keep existing implementation)
+        # ... (implementation remains the same) ...
         try:
             workflows = {}
             if os.path.exists(SYNTHESIZED_WORKFLOWS_FILE):
@@ -605,16 +809,20 @@ class Prometheus:
             workflows[command_name_with_slash] = sequence
             with open(SYNTHESIZED_WORKFLOWS_FILE, 'w') as f: json.dump(workflows, f, indent=4)
             prometheus_logger.info(f"Saved/Updated {command_name_with_slash} in {SYNTHESIZED_WORKFLOWS_FILE}")
-        # --- MODIFICATION: Removed emoji ---
         except Exception as e:
             prometheus_logger.exception(f"Error saving definition for {command_name_with_slash}: {e}"); print(f"   -> Prometheus Synthesis: [ERROR] saving workflow: {e}")
 
-    # --- Background Correlation Analysis ---
-    # ... (background_correlation_analysis remains the same) ...
     async def background_correlation_analysis(self):
+        # ... (implementation remains the same - excluding powerscore) ...
         try: from main_singularity import get_sp500_symbols_singularity
         except ImportError: prometheus_logger.error("Failed import get_sp500_symbols_singularity."); return
-        commands_to_correlate = { 'derivative': {'func': self.derivative_func, 'args': [], 'ai_params': {}, 'period': '1y', 'value_key': 'second_derivative_at_end'}, 'mlforecast': {'func': self.mlforecast_func, 'args': [], 'ai_params': {}, 'period': '5-Day', 'value_key': 'Est. % Change'}, 'powerscore': {'func': self.powerscore_func, 'args': [], 'ai_params': {'sensitivity': 2}, 'value_key': 'powerscore'}, 'sentiment': {'func': self.sentiment_func, 'args': [], 'ai_params': {}, 'value_key': 'sentiment_score_raw'}, 'fundamentals': {'func': self.fundamentals_func, 'args': [], 'ai_params': {}, 'value_key': 'fundamental_score'}, 'quickscore': {'func': self.quickscore_func, 'args': [], 'ai_params': {'ema_interval': 2}, 'value_key': 'score'} }
+        commands_to_correlate = {
+            'derivative': {'func': self.derivative_func, 'args': [], 'ai_params': {}, 'period': '1y', 'value_key': 'second_derivative_at_end'},
+            'mlforecast': {'func': self.mlforecast_func, 'args': [], 'ai_params': {}, 'period': '5-Day', 'value_key': 'Est. % Change'},
+            'sentiment': {'func': self.sentiment_func, 'args': [], 'ai_params': {}, 'value_key': 'sentiment_score_raw'},
+            'fundamentals': {'func': self.fundamentals_func, 'args': [], 'ai_params': {}, 'value_key': 'fundamental_score'},
+            'quickscore': {'func': self.quickscore_func, 'args': [], 'ai_params': {'ema_interval': 2}, 'value_key': 'score'}
+        }
         valid_commands_to_run = { cmd: config for cmd, config in commands_to_correlate.items() if config['func'] is not None };
         if not valid_commands_to_run: prometheus_logger.error("BG Corr: No valid functions."); print("[Prometheus Background] ERROR: No valid functions."); return
         prometheus_logger.info(f"BG Corr: Will analyze: {list(valid_commands_to_run.keys())}")
@@ -655,7 +863,6 @@ class Prometheus:
                      for i, (ticker, result) in enumerate(raw_cmd_results):
                          if isinstance(result, Exception): continue; extracted_value = None
                          try:
-                             # ... (result extraction logic remains the same) ...
                              if cmd == 'derivative' and isinstance(result, dict) and config.get('period') in result.get('periods', {}): period_data = result['periods'][config['period']]; extracted_value = period_data.get(value_key) if period_data.get('status') == 'success' else None
                              elif cmd == 'mlforecast' and isinstance(result, list) and result:
                                  for forecast in result:
@@ -677,32 +884,24 @@ class Prometheus:
              except Exception as e: prometheus_logger.exception(f"ERROR BG correlation cycle: {e}"); print(f"[Prometheus Background] Cycle ERROR: {e}")
              finally: cycle_end_time = datetime.now(); duration = cycle_end_time - cycle_start_time; prometheus_logger.info(f"BG cycle finished. Duration: {duration}"); print(f"[Prometheus Background] Cycle finished @ {cycle_end_time.strftime('%H:%M:%S')} (Duration: {duration}).")
 
-
-    # --- Market Memo Generation ---
     async def generate_market_memo(self, args: List[str] = None, ai_params: Optional[Dict] = None, is_called_by_ai: bool = False, prometheus_instance: 'Prometheus' = None, gemini_model_obj: Any = None):
-        # ... (generate_market_memo remains the same) ...
-        """
-        Analyzes recent logs and market context to generate a daily memo.
-        Called via the /memo command.
-        """
+        # ... (implementation remains the same) ...
+        """ Analyzes recent logs and market context to generate a daily memo. """
         prometheus_logger.info("Generating Market Memo...")
         print("\n--- Generating Prometheus Market Memo ---")
         if not self.gemini_model:
             print("❌ Error: Gemini model not initialized. Cannot generate memo.")
             return {"status": "error", "message": "Gemini model not available."}
 
-        # 1. Fetch Current Market Context
         print("  -> Fetching current market context (/risk)...")
         market_context_dict = {}
         try:
-            # Use execute_and_log to ensure proper context fetching and logging
             risk_result = await self.execute_and_log("/risk", ai_params={"assessment_type": "standard"}, internal_call=True)
             if isinstance(risk_result, dict) and risk_result.get("status") != "error":
-                 # Extract key pieces of info
                  market_context_dict['VIX Price'] = risk_result.get('vix_price', 'N/A')
                  market_context_dict['Market Invest Score'] = risk_result.get('market_invest_score', 'N/A')
                  market_context_dict['Combined Score'] = risk_result.get('combined_score', 'N/A')
-                 market_context_dict['Market IVR'] = risk_result.get('market_ivr', 'N/A') # From updated /risk
+                 market_context_dict['Market IVR'] = risk_result.get('market_ivr', 'N/A')
                  print("     ...Market context fetched.")
             else:
                  print("     ⚠️ Warning: Failed to fetch market context via /risk.")
@@ -711,14 +910,12 @@ class Prometheus:
             print(f"     ❌ Error fetching market context: {e_ctx}")
             market_context_dict['Status'] = f'Error fetching context: {e_ctx}'
 
-        # 2. Query Recent Command Log (Knowledge Base)
         print("  -> Querying recent command history...")
         recent_logs = []
         conn = None
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            # Fetch last 10 successful commands from the past 24 hours
             cutoff_time = (datetime.now() - timedelta(hours=24)).isoformat()
             cursor.execute("""
                 SELECT command, parameters, output_summary
@@ -739,7 +936,6 @@ class Prometheus:
             if conn: conn.close()
             recent_logs = [{"error": f"Failed to query logs: {e_db}"}]
 
-        # 3. Construct Prompt for Gemini
         print("  -> Constructing prompt for AI memo generation...")
         today_date = datetime.now().strftime('%B %d, %Y')
         prompt = f"""
@@ -755,22 +951,20 @@ class Prometheus:
         **Instructions:**
         1.  Synthesize the market context (scores, VIX, IVR) and recent command results.
         2.  Identify potential trends, shifts, or notable findings (e.g., strong sector sentiment, recurring breakout patterns, interesting correlations found).
-        3.  Suggest 1-2 potentially relevant strategies or areas of focus given the current conditions, referencing specific tools (like /sector, /assess, /powerscore) if applicable.
+        3.  Suggest 1-2 potentially relevant strategies or areas of focus given the current conditions, referencing specific tools (like /sector, /assess) if applicable.
         4.  Keep the memo brief and action-oriented. Avoid definitive predictions.
         5.  Do NOT invent data not present in the context or logs. If context/logs are unavailable or empty, state that the analysis is limited.
 
         **Market Memo for {today_date}:**
         """
 
-        # 4. Generate Memo using Gemini
         print("  -> Sending request to Gemini for memo generation...")
         memo_text = "Error: Memo generation failed."
         try:
-             # Use the Gemini model instance associated with Prometheus
              response = await asyncio.to_thread(
                  self.gemini_model.generate_content,
                  prompt,
-                 generation_config=genai.types.GenerationConfig(temperature=0.5) # Allow some creativity
+                 generation_config=genai.types.GenerationConfig(temperature=0.5)
              )
              if response and response.text:
                   memo_text = response.text.strip()
@@ -783,52 +977,32 @@ class Prometheus:
              print(f"     ❌ Error during AI memo generation: {e_ai}")
              memo_text = f"Memo Generation Error: {e_ai}"
 
-        # 5. Display Memo
         print("\n" + "="*25 + " Prometheus Market Memo " + "="*25)
         print(f"Date: {today_date}\n")
         print(memo_text)
         print("="*72)
 
-        # Log this action separately? Or rely on the /memo command log entry?
-        # For now, rely on the /memo entry in execute_and_log.
+        return {"status": "success", "memo_text": memo_text}
 
-        return {"status": "success", "memo_text": memo_text} # Return dict for logging
-
-    # <<< --- NEW: Strategy Recipe Generation --- >>>
-    async def generate_strategy_recipe(self, args: List[str] = None, ai_params: Optional[Dict] = None, is_called_by_ai: bool = False, called_by_user: bool = False, prometheus_instance: 'Prometheus' = None, gemini_model_obj: Any = None): # <<< Added called_by_user parameter
-        """
-        Uses the AI to generate a step-by-step strategy recipe based on a user's goal.
-        Called via the /strategy_recipe command.
-        """
+    async def generate_strategy_recipe(self, args: List[str] = None, ai_params: Optional[Dict] = None, is_called_by_ai: bool = False, called_by_user: bool = False, prometheus_instance: 'Prometheus' = None, gemini_model_obj: Any = None):
+        # ... (implementation remains the same) ...
+        """ Uses the AI to generate a step-by-step strategy recipe. """
         prometheus_logger.info("Generating Strategy Recipe...")
         print("\n--- Generating Prometheus Strategy Recipe ---")
         if not self.gemini_model:
             print("❌ Error: Gemini model not initialized. Cannot generate recipe.")
             return {"status": "error", "message": "Gemini model not available."}
 
-        # 1. Get User Goal
         user_goal = ""
-        # Use the now defined 'called_by_user' variable
         if called_by_user and args:
             user_goal = " ".join(args)
-        elif not called_by_user and ai_params: # If called internally by AI
+        elif not called_by_user and ai_params:
             user_goal = ai_params.get("goal", "")
-        elif called_by_user: # Interactive prompt if no args from user
-            # --- Use the existing helper for interactive input ---
-            # user_goal = input("Enter your high-level strategy goal (e.g., 'find undervalued high-growth tech stocks'): ")
-            # --- Import ask_singularity_input helper if not already available ---
-            # --- Or, assume this interactive part only happens via Prometheus shell ---
-            # --- For simplicity, let's assume direct /strategy_recipe always gets args ---
-            # --- and Prometheus shell handles its own input ---
-            # --- Let's revert to the original logic slightly modified ---
-            # --- The primary way this function is called by a user is via the /strategy_recipe command,
-            # --- which passes 'args'. The Prometheus shell ('generate recipe ...') also passes 'args'.
-            # --- So, we primarily need 'args' when called_by_user is True.
-             if not args: # Check if args is empty when called by user
+        elif called_by_user:
+             if not args:
                  print("Error: Please provide a strategy goal after the command.")
                  return {"status": "error", "message": "Strategy goal is required when called by user."}
-             user_goal = " ".join(args) # Re-added this line for clarity
-
+             user_goal = " ".join(args)
 
         if not user_goal:
             print("❌ Error: No strategy goal provided.")
@@ -837,24 +1011,22 @@ class Prometheus:
         prometheus_logger.debug(f"User goal for recipe: {user_goal}")
         print(f"  -> User Goal: '{user_goal}'")
 
-        # 2. Get Available Tool Names (excluding self)
         available_tool_list = [f"/{name}" for name in self.toolbox.keys() if name != "strategy_recipe"]
         prometheus_logger.debug(f"Available tools for recipe: {available_tool_list}")
 
-        # 3. Construct Prompt for Gemini
         print("  -> Constructing prompt for AI recipe generation...")
         prompt = f"""
-        Act as Prometheus, an AI strategist. Your task is to design a step-by-step investment strategy based on the user's high-level goal, using ONLY the available tools.
+        Act as Prometheus, an AI strategist. Your task is to design a step-by-step investment strategy based on the user's high-level goal description, using ONLY the available tools.
 
-        **User's Goal:** "{user_goal}"
+        **User's Goal Description:** "{user_goal}"
 
         **Available Tools:**
         {', '.join(available_tool_list)}
 
         **Instructions:**
-        1.  Analyze the user's goal.
+        1.  Analyze the user's goal description.
         2.  Create a logical sequence of 3-7 steps using the available tools to achieve the goal.
-        3.  For each step, clearly state the tool to use (e.g., "/sector") and the specific parameters needed (e.g., "Semiconductors & Semiconductor Equipment"). If parameters depend on previous steps, explain how (e.g., "Run /powerscore on the top 5 tickers from step 3").
+        3.  For each step, clearly state the tool to use (e.g., "/sector") and the specific parameters needed (e.g., "Semiconductors & Semiconductor Equipment"). If parameters depend on previous steps, explain how (e.g., "Run /quickscore on the top 5 tickers from step 3").
         4.  Focus ONLY on creating the recipe steps. Do NOT execute the strategy.
         5.  Format your response clearly using numbered steps. Start directly with step 1.
         6.  If a goal seems impossible or requires unavailable tools, state that clearly instead of generating steps.
@@ -862,7 +1034,6 @@ class Prometheus:
         **Proposed Strategy Recipe:**
         """
 
-        # 4. Generate Recipe using Gemini
         print("  -> Sending request to Gemini for recipe generation...")
         recipe_text = "Error: Recipe generation failed."
         recipe_steps = []
@@ -870,19 +1041,17 @@ class Prometheus:
              response = await asyncio.to_thread(
                  self.gemini_model.generate_content,
                  prompt,
-                 generation_config=genai.types.GenerationConfig(temperature=0.3) # More focused output
+                 generation_config=genai.types.GenerationConfig(temperature=0.3)
              )
              if response and response.text:
                   raw_text = response.text.strip()
-                  # Basic parsing: split by lines starting with a number and a dot.
                   potential_steps = re.split(r'\n\s*(?=\d+\.\s)', raw_text)
                   recipe_steps = [step.strip() for step in potential_steps if step.strip()]
                   if recipe_steps:
                       recipe_text = "\n".join(recipe_steps)
                       print("     ...Recipe generated successfully.")
                   else:
-                      # Handle cases where AI might respond without numbered steps
-                      recipe_text = raw_text # Use the raw text if parsing fails
+                      recipe_text = raw_text
                       print("     ⚠️ Warning: AI response formatting might be unexpected.")
              else:
                   print("     ⚠️ Warning: AI returned an empty response.")
@@ -894,7 +1063,6 @@ class Prometheus:
              recipe_text = f"Recipe Generation Error: {e_ai}"
              recipe_steps = [recipe_text]
 
-        # 5. Display Recipe
         print("\n" + "="*25 + " Prometheus Strategy Recipe " + "="*25)
         print(f"Goal: {user_goal}\n")
         print("Proposed Strategy:")
@@ -902,19 +1070,771 @@ class Prometheus:
         print("="*74)
 
         prometheus_logger.info(f"Generated strategy recipe for goal: {user_goal}")
-        return {"status": "success", "recipe_steps": recipe_steps} # Return dict for logging
-    # <<< --- END: Strategy Recipe Generation --- >>>
+        return {"status": "success", "recipe_steps": recipe_steps}
+
+
+    async def generate_improvement_hypothesis(self, command_filename: str):
+        # ... (implementation remains the same) ...
+        """ Uses the LLM to analyze command code and performance logs to propose improvements. """
+        prometheus_logger.info(f"Generating improvement hypothesis for {command_filename}")
+        print(f"\n--- Generating Improvement Hypothesis for {command_filename} ---")
+        if not self.gemini_model:
+            print("❌ Error: Gemini model not initialized.")
+            return {"status": "error", "message": "Gemini model not available."}
+
+        print("  -> Reading command source code...")
+        code_content = self.read_command_code(command_filename)
+        if not code_content:
+            print("❌ Error: Could not read source code.")
+            return {"status": "error", "message": f"Could not read source code for {command_filename}"}
+        print("     ...Code read successfully.")
+
+        print("  -> Querying performance logs...")
+        command_name_for_log = "/" + command_filename.replace("_command.py", "")
+        performance_summary = {"total_runs": 0, "success_rate": "N/A", "avg_duration_ms": "N/A"}
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*), AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END), AVG(duration_ms) FROM command_log WHERE command = ?", (command_name_for_log,))
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                performance_summary["total_runs"] = result[0]
+                performance_summary["success_rate"] = f"{result[1]*100:.1f}%" if result[1] is not None else "N/A"
+                performance_summary["avg_duration_ms"] = f"{result[2]:.0f} ms" if result[2] is not None else "N/A"
+                print(f"     ...Found {result[0]} log entries. Success: {performance_summary['success_rate']}, Avg Duration: {performance_summary['avg_duration_ms']}")
+            else:
+                print("     ...No performance logs found for this command.")
+            conn.close()
+        except Exception as e_db:
+            print(f"     ❌ Error querying logs: {e_db}")
+            if conn: conn.close()
+            performance_summary["error"] = f"Error querying logs: {e_db}"
+
+        print("  -> Constructing prompt for AI analysis...")
+        max_code_chars = 15000
+        code_snippet = code_content[:max_code_chars] + ("\n... [Code Truncated]" if len(code_content) > max_code_chars else "")
+
+        prompt = f"""
+        Act as Prometheus, an AI code optimizer. Analyze the following Python code for the command '{command_name_for_log}' and its performance summary.
+
+        **Command Code (may be truncated):**
+        ```python
+        {code_snippet}
+        ```
+
+        **Performance Summary:**
+        {json.dumps(performance_summary, indent=2)}
+
+        **Task:**
+        1.  Identify potential areas for improvement in the code (e.g., efficiency bottlenecks, error handling gaps, opportunities for better logic, parameter tuning needs based on logs).
+        2.  Formulate a specific, actionable hypothesis for improvement. Describe WHAT change you propose and WHY it might be better based on the code and performance data.
+        3.  Focus ONLY on the hypothesis. Do NOT provide the full modified code yet. If no obvious improvement is found, state that.
+
+        **Improvement Hypothesis for {command_filename}:**
+        """
+
+        print("  -> Sending request to Gemini for hypothesis generation...")
+        hypothesis_text = "Error: Hypothesis generation failed."
+        try:
+             response = await asyncio.to_thread(
+                 self.gemini_model.generate_content,
+                 prompt,
+                 generation_config=genai.types.GenerationConfig(temperature=0.4)
+             )
+             if response and response.text:
+                  hypothesis_text = response.text.strip()
+                  print("     ...Hypothesis generated.")
+             else:
+                  print("     ⚠️ Warning: AI returned an empty response for hypothesis.")
+                  hypothesis_text = "Hypothesis Error: AI returned no text."
+        except Exception as e_ai:
+             print(f"     ❌ Error during AI hypothesis generation: {e_ai}")
+             hypothesis_text = f"Hypothesis Error: {e_ai}"
+
+        print("\n" + "-"*30)
+        print(f" Prometheus Improvement Hypothesis for {command_filename}")
+        print("-"*30)
+        print(hypothesis_text)
+        print("-"*30)
+
+        prometheus_logger.info(f"Generated hypothesis for {command_filename}")
+        return {"status": "success", "hypothesis": hypothesis_text, "filename": command_filename, "original_code": code_content}
+
+
+    async def _generate_improved_code(self, command_filename: str, original_code: str, improvement_hypothesis: str) -> Optional[str]:
+        """ Uses the LLM to generate improved code and saves it to a *temporary* file. Returns the temp filepath. """
+        prometheus_logger.info(f"Generating improved code for {command_filename} based on hypothesis.")
+        print(f"\n--- Generating Improved Code for {command_filename} ---")
+        if not self.gemini_model:
+            print("❌ Error: Gemini model not initialized.")
+            return None
+
+        print("  -> Constructing prompt for AI code generation...")
+        prompt = f"""
+        Act as Prometheus, an AI code generator. You are given the original Python code for the command '{command_filename}' and a hypothesis for improving it.
+
+        **Improvement Hypothesis:**
+        {improvement_hypothesis}
+
+        **Original Code:**
+        ```python
+        {original_code}
+        ```
+
+        **Task:**
+        Rewrite the *entire* original Python code, incorporating the changes suggested in the hypothesis.
+        - Ensure the generated code is complete, correct, and runnable Python code.
+        - Preserve the original function signatures and overall structure where possible, unless the hypothesis explicitly requires changes.
+        - Your response MUST contain ONLY the final, complete Python code block, starting with ```python and ending with ```.
+        - Do NOT include any explanations, comments about changes, or introductory/concluding text outside the code block.
+
+        **Improved Code:**
+        """
+
+        print("  -> Sending request to Gemini for code generation...")
+        generated_code = None
+        temp_filepath = None # Define here for use in exception blocks
+        try:
+             response = await asyncio.to_thread(
+                 self.gemini_model.generate_content,
+                 prompt,
+                 generation_config=genai.types.GenerationConfig(temperature=0.1)
+             )
+             if response and response.text:
+                  code_match = re.search(r'```python\n(.*)```', response.text, re.DOTALL)
+                  if code_match:
+                      generated_code = code_match.group(1).strip()
+                      print("     ...Code generated successfully.")
+                  else:
+                      prometheus_logger.warning("AI response did not contain a valid Python code block.")
+                      print("     ⚠️ Warning: AI response did not contain a valid Python code block. Using raw response.")
+                      generated_code = response.text.replace('```python', '').replace('```', '').strip()
+                      if not generated_code:
+                          raise ValueError("AI returned unusable code response.")
+             else:
+                  prometheus_logger.error("AI returned an empty response for code generation.")
+                  print("     ❌ Error: AI returned an empty response.")
+                  return None
+
+        except Exception as e_ai:
+             prometheus_logger.exception(f"Error during AI code generation: {e_ai}")
+             print(f"     ❌ Error during AI code generation: {e_ai}")
+             return None
+
+        # --- Save to temporary file ---
+        try:
+            # Create a unique temporary filename in IMPROVED_CODE_DIR
+            temp_filename = f"{command_filename.replace('.py', '')}_prom_temp_{uuid.uuid4().hex[:8]}.py"
+            temp_filepath = os.path.join(IMPROVED_CODE_DIR, temp_filename)
+
+            print(f"  -> Saving generated code to temporary file: {temp_filepath}")
+            os.makedirs(IMPROVED_CODE_DIR, exist_ok=True)
+            with open(temp_filepath, 'w', encoding='utf-8') as f:
+                f.write(generated_code)
+            prometheus_logger.info(f"Saved generated code temporarily to '{temp_filepath}'")
+            print("     ...Temporary code saved.")
+            return temp_filepath # Return the path to the temporary file
+        except IOError as e:
+            prometheus_logger.exception(f"IOError saving generated code to '{temp_filepath}': {e}")
+            print(f"     ❌ Error saving generated code: {e}")
+            return None
+        except Exception as e:
+            prometheus_logger.exception(f"Unexpected error saving generated code: {e}")
+            print(f"     ❌ Unexpected error saving generated code: {e}")
+            return None
+        
+    async def _compare_command_performance(self, original_filename: str, improved_filepath: str, ticker: str = "SPY", period: str = "1y", initial_capital: float = 10000.0) -> Optional[Tuple[Dict, Dict]]:
+        """
+        Loads and backtests both original and improved strategy code, then compares results.
+        Only attempts backtest if files contain a valid 'Strategy' class.
+        Accepts full path for improved file. Returns comparison results tuple or None.
+        """
+        prometheus_logger.info(f"Comparing performance: '{original_filename}' vs '{os.path.basename(improved_filepath)}' on {ticker} ({period})")
+        print(f"\n--- Comparing Performance: {original_filename} vs. {os.path.basename(improved_filepath)} ---")
+        print(f"    Ticker: {ticker}, Period: {period}, Initial Capital: ${initial_capital:,.2f}")
+
+        # --- Locate Files ---
+        original_filepath = os.path.join(os.path.dirname(__file__), COMMANDS_DIR, original_filename)
+        # improved_filepath is already a full path
+
+        if not os.path.exists(original_filepath):
+            print(f"❌ Error: Original file not found: {original_filepath}")
+            return None
+        if not os.path.exists(improved_filepath):
+            print(f"❌ Error: Improved file not found: {improved_filepath}")
+            return None
+
+        # --- Load Strategy Classes ---
+        print("  -> Loading strategy classes...")
+        OriginalStrategy = self._load_strategy_class_from_file(original_filepath)
+        ImprovedStrategy = self._load_strategy_class_from_file(improved_filepath)
+
+        # --- Check if Classes are Backtestable ---
+        original_is_backtestable = OriginalStrategy and hasattr(OriginalStrategy(pd.DataFrame()), 'generate_signals')
+        improved_is_backtestable = ImprovedStrategy and hasattr(ImprovedStrategy(pd.DataFrame()), 'generate_signals')
+
+        if not original_is_backtestable:
+             print(f"⚠️ Warning: Original file '{original_filename}' does not appear to contain a backtestable 'Strategy' class.")
+        if not improved_is_backtestable:
+             print(f"⚠️ Warning: Improved file '{os.path.basename(improved_filepath)}' does not appear to contain a backtestable 'Strategy' class.")
+
+        if not original_is_backtestable or not improved_is_backtestable:
+             print("❌ Cannot perform backtest comparison. Both files must contain valid backtest strategies.")
+             return None # Return None if not comparable
+
+        print("     ...Strategy classes loaded successfully.")
+
+        # --- Fetch Data ---
+        print(f"  -> Fetching backtest data for {ticker} ({period})...")
+        fetch_start_date, fetch_end_date = self._parse_period_to_dates(period)
+        if not fetch_start_date or not fetch_end_date:
+            print(f"❌ Error: Invalid period string '{period}'.")
+            return None
+        # Fetch extra data for indicators
+        fetch_start_date_extended = (datetime.strptime(fetch_start_date, '%Y-%m-%d') - timedelta(days=90)).strftime('%Y-%m-%d')
+
+        backtest_data = await get_yf_download_robustly(
+            tickers=[ticker], start=fetch_start_date_extended, end=fetch_end_date, interval="1d", auto_adjust=False
+        )
+        if backtest_data.empty: print(f"❌ Failed to fetch backtest data for {ticker}."); return None
+
+        # Standardize columns if needed (single ticker download might be flat)
+        if not isinstance(backtest_data.columns, pd.MultiIndex):
+             backtest_data.columns = pd.MultiIndex.from_product([backtest_data.columns, [ticker]], names=['Price', 'Ticker'])
+
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+        if not all((col, ticker) in backtest_data.columns for col in required_cols):
+             print(f"❌ Fetched data for {ticker} missing required columns. Has: {backtest_data.columns.tolist()}")
+             return None
+
+        # Filter to exact period *after* fetching extra
+        backtest_data = backtest_data.loc[fetch_start_date:fetch_end_date]
+        if backtest_data.empty: print(f"❌ No data remaining for {ticker} after filtering for period {period}."); return None
+        print("     ...Data fetched successfully.")
+
+        # --- Run Backtests ---
+        print("  -> Running backtest on Original code...")
+        original_results = self._run_single_backtest(OriginalStrategy, backtest_data.copy(), initial_capital, ticker) # Pass copy of data
+
+        print("  -> Running backtest on Improved code...")
+        improved_results = self._run_single_backtest(ImprovedStrategy, backtest_data.copy(), initial_capital, ticker) # Pass copy of data
+
+        # --- Compare and Display ---
+        print("\n--- Backtest Comparison ---")
+        if original_results and improved_results:
+            comparison_data = [
+                ["Metric", "Original", "Improved", "Change"],
+                ["Final Value ($)", f"{original_results['final_value']:,.2f}", f"{improved_results['final_value']:,.2f}", f"{improved_results['final_value'] - original_results['final_value']:+,.2f}"],
+                ["Total Return (%)", f"{original_results['total_return_pct']:.2f}%", f"{improved_results['total_return_pct']:.2f}%", f"{improved_results['total_return_pct'] - original_results['total_return_pct']:+.2f}%"],
+                ["Sharpe Ratio", f"{original_results['sharpe_ratio']:.3f}", f"{improved_results['sharpe_ratio']:.3f}", f"{improved_results['sharpe_ratio'] - original_results['sharpe_ratio']:+.3f}"],
+                ["Max Drawdown (%)", f"{original_results['max_drawdown_pct']:.2f}%", f"{improved_results['max_drawdown_pct']:.2f}%", f"{improved_results['max_drawdown_pct'] - original_results['max_drawdown_pct']:+.2f}%"],
+                ["Trades", f"{original_results['trade_count']}", f"{improved_results['trade_count']}", f"{improved_results['trade_count'] - original_results['trade_count']:+}"]
+            ]
+            print(tabulate(comparison_data, headers="firstrow", tablefmt="grid", floatfmt=".2f"))
+            prometheus_logger.info("Backtest comparison completed.")
+            return original_results, improved_results # Return results for confirmation step
+        else:
+            print("❌ One or both backtests failed. Cannot compare results.")
+            prometheus_logger.error("Backtest comparison failed because one or both backtests did not return results.")
+            return None # Indicate failure
+        
+    def _load_strategy_class_from_file(self, filepath: str) -> Optional[type]:
+        # ... (implementation remains the same) ...
+        """Dynamically loads the 'Strategy' class from a Python file."""
+        module_name = f"prometheus_strategy_{os.path.basename(filepath).replace('.py', '')}_{random.randint(1000, 9999)}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, filepath)
+            if spec is None or spec.loader is None:
+                prometheus_logger.error(f"Could not create module spec for {filepath}")
+                return None
+            strategy_module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = strategy_module
+            spec.loader.exec_module(strategy_module)
+
+            if hasattr(strategy_module, 'Strategy'):
+                prometheus_logger.debug(f"Successfully loaded Strategy class from {filepath}")
+                return strategy_module.Strategy
+            else:
+                 prometheus_logger.error(f"'Strategy' class not found in {filepath}")
+                 return None
+        except SyntaxError as e:
+            prometheus_logger.exception(f"Syntax error loading strategy from '{filepath}': {e}")
+            print(f"❌ Syntax Error loading {filepath}: {e}")
+            return None
+        except Exception as e:
+            prometheus_logger.exception(f"Error loading strategy from '{filepath}': {e}")
+            return None
+        finally:
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+
+    def _run_single_backtest(self, StrategyClass: type, data: pd.DataFrame, initial_capital: float, ticker: str) -> Optional[Dict[str, Any]]:
+        # ... (implementation remains the same) ...
+        """ Executes a vectorized backtest for a single strategy class. """
+        prometheus_logger.debug(f"Running backtest for strategy: {StrategyClass.__name__}")
+        if data.empty:
+            prometheus_logger.error("Backtest skipped: Input data is empty.")
+            return None
+
+        try:
+            strategy_instance = StrategyClass(data=data, params={})
+            if not hasattr(strategy_instance, 'generate_signals') or not callable(strategy_instance.generate_signals):
+                prometheus_logger.error(f"Backtest failed: Strategy class {StrategyClass.__name__} missing callable 'generate_signals' method.")
+                return None
+            signals_multi = strategy_instance.generate_signals()
+            if not isinstance(signals_multi, pd.DataFrame):
+                prometheus_logger.error(f"Backtest failed: generate_signals for {StrategyClass.__name__} did not return a DataFrame (returned {type(signals_multi)}).")
+                return None
+            prometheus_logger.debug(f"Signals generated, shape: {signals_multi.shape}")
+
+            adj_close_prices = data.loc[:, pd.IndexSlice[('Adj Close', ticker)]].droplevel(1, axis=1).squeeze()
+            if adj_close_prices.empty or adj_close_prices.isnull().all():
+                 prometheus_logger.error(f"Backtest failed: No valid 'Adj Close' data for {ticker}.")
+                 return None
+
+            if ticker not in signals_multi.columns:
+                 ticker_lower = ticker.lower()
+                 matching_cols = [col for col in signals_multi.columns if str(col).lower() == ticker_lower]
+                 if not matching_cols:
+                      prometheus_logger.error(f"Backtest failed: Signal column for {ticker} not found in Strategy output. Columns: {signals_multi.columns.tolist()}")
+                      return None
+                 signal_col_name = matching_cols[0]
+                 signals = signals_multi[signal_col_name]
+                 prometheus_logger.warning(f"Used case-insensitive match for signal column: '{signal_col_name}' for ticker '{ticker}'")
+            else:
+                 signals = signals_multi[ticker]
+
+            signals = signals.reindex(adj_close_prices.index).ffill().fillna(0)
+
+            daily_returns = adj_close_prices.pct_change()
+            positions = signals.shift(1).fillna(0)
+            strategy_returns = positions * daily_returns
+            cumulative_strategy_returns = (1 + strategy_returns).cumprod()
+
+            final_value = initial_capital * cumulative_strategy_returns.iloc[-1]
+            total_return_pct = (cumulative_strategy_returns.iloc[-1] - 1) * 100
+            excess_returns = strategy_returns
+            sharpe_ratio = (np.mean(excess_returns) / np.std(excess_returns)) * np.sqrt(252) if np.std(excess_returns) != 0 else 0
+            running_max = cumulative_strategy_returns.cummax()
+            drawdown = (cumulative_strategy_returns - running_max) / running_max
+            max_drawdown_pct = drawdown.min() * 100
+            trade_count = (positions.diff().abs() > 0).sum()
+
+            results = {
+                "final_value": final_value,
+                "total_return_pct": total_return_pct,
+                "sharpe_ratio": sharpe_ratio,
+                "max_drawdown_pct": max_drawdown_pct,
+                "trade_count": trade_count
+            }
+            prometheus_logger.debug(f"Backtest results: {results}")
+            return results
+
+        except Exception as e:
+            prometheus_logger.exception(f"CRITICAL: Backtest execution failed for {StrategyClass.__name__}. Error: {e}")
+            return None
+
+    def _parse_period_to_dates(self, period_str: str) -> Tuple[Optional[str], Optional[str]]:
+        # ... (implementation remains the same) ...
+        """ Converts period string (e.g., '1y', '3mo') to start/end dates. """
+        end_date = datetime.now()
+        start_date = None
+        num_match = re.search(r'(\d+)', period_str.lower())
+        if not num_match: return None, None
+        try:
+            num = int(num_match.group(1))
+            if 'y' in period_str: start_date = end_date - relativedelta(years=num)
+            elif 'mo' in period_str: start_date = end_date - relativedelta(months=num)
+            elif 'd' in period_str: start_date = end_date - relativedelta(days=num)
+            else: return None, None
+            return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+        except ValueError:
+            return None, None
+
+
+# --- NEW: Core Genetic Algorithm Functions ---
+
+    async def _evaluate_fitness(self, population: List[Dict[str, Any]], command_name: str, strategy_name: Optional[str] = None) -> List[Tuple[Dict[str, Any], float]]:
+        """
+        Evaluates the fitness of each individual in the population by querying
+        the command_log database for corresponding backtest results (Sharpe Ratio).
+        Returns a list of tuples: (individual_params, fitness_score) sorted by fitness.
+        """
+        prometheus_logger.info(f"Evaluating fitness for {len(population)} individuals ({command_name}/{strategy_name or ''}) using DB logs...")
+        population_with_fitness = []
+        conn = None
+        default_low_fitness = -10.0 # Assign a low score if no log found
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            for individual in population:
+                fitness_score = default_low_fitness # Default if not found
+                # Construct the command string to search for (e.g., /backtest)
+                command_to_find = command_name # Already includes '/'
+                # Construct the parameters string as it would be logged
+                # For /backtest, it's: [ticker, strategy, period, param1, param2, ...]
+                # We need to match the *parameter dictionary* portion, assuming it's stored consistently.
+                # A more robust approach might involve querying based on JSON content if parameters are always logged as JSON.
+                # Let's try matching the JSON representation of the individual parameters.
+                params_json_str = json.dumps(individual, sort_keys=True) # Ensure consistent ordering
+
+                try:
+                    # Query for successful backtests with matching parameters (JSON exact match)
+                    # We also need the strategy name in the parameters log for /backtest
+                    # The logged parameters might be a list: ["TICKER", "strategy", "period", p1, p2...]
+                    # Or they might be the ai_params dict if called internally.
+                    # Let's assume for now optimization targets backtests logged via CLI structure.
+                    # This query is complex and might need refinement based on how params are *actually* logged.
+                    # A simpler first approach: Query based on command and extract params later.
+
+                    # Simpler Query: Get all successful backtests for this command/strategy
+                    base_command = command_name.lstrip('/')
+                    strategy_part = f"%{strategy_name}%" if strategy_name else "%"
+                    # Query relies on parameters TEXT containing strategy name and param values. This is fragile.
+                    # TODO: Improve parameter logging/querying (e.g., dedicated columns or JSON querying)
+                    cursor.execute("""
+                        SELECT parameters, backtest_sharpe_ratio
+                        FROM command_log
+                        WHERE command = ? AND success = 1 AND backtest_sharpe_ratio IS NOT NULL
+                          AND parameters LIKE ?
+                        ORDER BY id DESC
+                        LIMIT 500
+                    """, (command_to_find, strategy_part)) # Limit search scope
+                    rows = cursor.fetchall()
+
+                    found_match = False
+                    # Iterate through results to find a parameter match
+                    for params_text, sharpe in rows:
+                        try:
+                            # Attempt to parse logged parameters (assuming list or dict stored as JSON)
+                            logged_params_data = json.loads(params_text)
+                            # Try to extract the parameter *dictionary* part
+                            param_dict_from_log = {}
+                            if isinstance(logged_params_data, list) and len(logged_params_data) > 3:
+                                # Assume CLI format: [ticker, strategy, period, p1, p2...]
+                                # We need param definitions to map args back to names
+                                param_defs = self._get_optimizable_params(command_name, strategy_name)
+                                if param_defs:
+                                     param_keys = list(param_defs.keys())
+                                     if len(logged_params_data[3:]) == len(param_keys):
+                                          param_dict_from_log = dict(zip(param_keys, logged_params_data[3:]))
+                                          # Convert types based on definitions for accurate comparison
+                                          for p_key, p_val in param_dict_from_log.items():
+                                               p_type = param_defs[p_key].get("type")
+                                               try:
+                                                    if p_type == "int": param_dict_from_log[p_key] = int(p_val)
+                                                    elif p_type == "float": param_dict_from_log[p_key] = float(p_val)
+                                               except (ValueError, TypeError):
+                                                    # Invalidate this log entry if type conversion fails
+                                                    param_dict_from_log = None
+                                                    break
+                                     else: param_dict_from_log = None # Mismatched number of params
+                            elif isinstance(logged_params_data, dict):
+                                param_dict_from_log = logged_params_data # Assume ai_params format
+
+                            # Compare the extracted/parsed dict with the individual, ensuring types match
+                            if param_dict_from_log and json.dumps(param_dict_from_log, sort_keys=True) == params_json_str:
+                                fitness_score = float(sharpe)
+                                found_match = True
+                                prometheus_logger.debug(f"  Found log match for {individual}. Sharpe: {fitness_score:.3f}")
+                                break # Found the most recent match
+                        except (json.JSONDecodeError, IndexError, TypeError, KeyError) as e_parse:
+                             prometheus_logger.warning(f"  Could not parse or compare logged params '{params_text}': {e_parse}")
+                             continue # Skip this log entry
+
+                    if not found_match:
+                         prometheus_logger.debug(f"  No exact log match found for {individual}. Assigning default fitness.")
+
+                except sqlite3.Error as e_sql:
+                    prometheus_logger.error(f"  SQL Error evaluating fitness for {individual}: {e_sql}")
+                    fitness_score = default_low_fitness # Penalize SQL errors too
+
+                population_with_fitness.append((individual, fitness_score))
+
+        except sqlite3.Error as e:
+            prometheus_logger.exception(f"Database error during fitness evaluation: {e}")
+            # Assign default fitness to all if DB fails
+            population_with_fitness = [(ind, default_low_fitness) for ind in population]
+        finally:
+            if conn:
+                conn.close()
+
+        # Sort by fitness (higher is better)
+        population_with_fitness.sort(key=lambda item: item[1], reverse=True)
+        if population_with_fitness:
+             best_fitness = population_with_fitness[0][1]
+             prometheus_logger.info(f"Fitness evaluation complete using DB logs. Best fitness (Sharpe): {best_fitness:.3f}")
+        else:
+             prometheus_logger.warning("Fitness evaluation complete, but population was empty.")
+
+        return population_with_fitness
     
+    def _select_parents(self, population_with_fitness: List[Tuple[Dict[str, Any], float]], num_parents: int) -> List[Dict[str, Any]]:
+        """
+        Selects the top-performing individuals as parents for the next generation.
+        Uses simple truncation selection (top N).
+        """
+        if num_parents > len(population_with_fitness):
+            prometheus_logger.warning(f"Requested {num_parents} parents, but only {len(population_with_fitness)} individuals available. Selecting all.")
+            num_parents = len(population_with_fitness)
+
+        parents = [individual for individual, fitness in population_with_fitness[:num_parents]]
+        prometheus_logger.info(f"Selected top {len(parents)} parents based on fitness.")
+        return parents
+
+    def _crossover(self, parents: List[Dict[str, Any]], offspring_size: int) -> List[Dict[str, Any]]:
+        """
+        Creates offspring by combining parameters from selected parents.
+        Uses simple single-point crossover for demonstration.
+        """
+        offspring = []
+        if not parents:
+            return offspring # Cannot create offspring without parents
+
+        num_parents = len(parents)
+        param_keys = list(parents[0].keys()) # Assume all parents have the same parameter keys
+
+        while len(offspring) < offspring_size:
+            # Randomly select two distinct parents
+            parent1_idx = random.randint(0, num_parents - 1)
+            parent2_idx = random.randint(0, num_parents - 1)
+            # Ensure parents are different if possible
+            while num_parents > 1 and parent1_idx == parent2_idx:
+                parent2_idx = random.randint(0, num_parents - 1)
+
+            parent1 = parents[parent1_idx]
+            parent2 = parents[parent2_idx]
+
+            # Choose a crossover point (index)
+            if len(param_keys) > 1:
+                crossover_point = random.randint(1, len(param_keys) - 1)
+            else:
+                crossover_point = 1 # Only one parameter, effectively takes from parent1
+
+            child = {}
+            # Take parameters before point from parent1, after point from parent2
+            for i, key in enumerate(param_keys):
+                if i < crossover_point:
+                    child[key] = parent1[key]
+                else:
+                    child[key] = parent2[key]
+
+            offspring.append(child)
+
+        prometheus_logger.info(f"Created {len(offspring)} offspring via crossover.")
+        return offspring
+
+    def _mutate(self, offspring: List[Dict[str, Any]], command_name: str, strategy_name: Optional[str] = None, mutation_rate: float = 0.1) -> List[Dict[str, Any]]:
+        """
+        Introduces random changes (mutations) into the offspring population.
+        """
+        param_definitions = self._get_optimizable_params(command_name, strategy_name)
+        if not param_definitions:
+            prometheus_logger.error(f"Cannot mutate: No optimizable parameter definitions found for {command_name}/{strategy_name or ''}")
+            return offspring # Return unchanged if no definitions
+
+        mutation_count = 0
+        for individual in offspring:
+            for param, definition in param_definitions.items():
+                if random.random() < mutation_rate:
+                    mutation_count += 1
+                    original_value = individual[param]
+                    param_type = definition.get("type")
+
+                    # Generate a new random value based on definition
+                    new_value = original_value # Default to original if mutation fails
+                    if "values" in definition:
+                         new_value = random.choice([v for v in definition["values"] if v != original_value] or [original_value]) # Avoid choosing same value if possible
+                    elif param_type == "int":
+                        step = definition.get("step", 1)
+                        min_val = definition.get("min")
+                        max_val = definition.get("max")
+                        if min_val is not None and max_val is not None:
+                            num_steps = (max_val - min_val) // step
+                            new_value = min_val + random.randint(0, num_steps) * step
+                        else: new_value = random.randint(0, 100) # Fallback
+                    elif param_type == "float":
+                        step = definition.get("step", 0.1)
+                        min_val = definition.get("min")
+                        max_val = definition.get("max")
+                        if min_val is not None and max_val is not None:
+                             val = random.uniform(min_val, max_val)
+                             new_value = round(round(val / step) * step, 8)
+                        else: new_value = round(random.uniform(0.0, 1.0), 4) # Fallback
+
+                    individual[param] = new_value
+                    prometheus_logger.debug(f"Mutated param '{param}': {original_value} -> {new_value}")
+
+        if mutation_count > 0:
+             prometheus_logger.info(f"Applied {mutation_count} mutations across offspring.")
+        return offspring
+
+    # --- NEW: Main GA Optimization Loop ---
+    async def run_parameter_optimization(self, command_name: str, strategy_name: Optional[str],
+                                         ticker: str, period: str,
+                                         generations: int = 10, population_size: int = 20,
+                                         num_parents: int = 10, mutation_rate: float = 0.1):
+        """
+        Runs the genetic algorithm to optimize parameters for a given command/strategy.
+        """
+        prometheus_logger.info(f"Starting GA optimization for {command_name}/{strategy_name or ''} on {ticker} ({period})")
+        print(f"\n--- Starting Parameter Optimization ---")
+        print(f" Target Command: {command_name}")
+        if strategy_name: print(f" Strategy: {strategy_name}")
+        print(f" Ticker: {ticker}")
+        print(f" Period: {period}")
+        print(f" Generations: {generations}")
+        print(f" Population Size: {population_size}")
+        print(f"------------------------------------")
+
+        # --- Define default_low_fitness here ---
+        default_low_fitness = -10.0
+        # --- End Definition ---
+
+        if command_name != "/backtest":
+            print("❌ Error: Parameter optimization is currently only supported for the /backtest command.")
+            prometheus_logger.error("Optimization called for unsupported command.")
+            return
+
+        param_defs = self._get_optimizable_params(command_name, strategy_name)
+        if not param_defs:
+            print(f"❌ Error: No optimizable parameters defined for {command_name}/{strategy_name or ''}.")
+            return
+
+        # 1. Initialize Population
+        print("\n[Generation 0] Initializing population...")
+        current_population = self._generate_initial_population(command_name, strategy_name, population_size)
+        if not current_population:
+            print("❌ Error: Failed to generate initial population.")
+            return
+
+        best_individual_overall = None
+        best_fitness_overall = -float('inf')
+
+        # 2. Evolution Loop
+        for gen in range(generations):
+            print(f"\n--- [Generation {gen + 1}/{generations}] ---")
+
+            # 2a. Run Backtests for current population (if fitness not already known)
+            print(f" -> Checking logs & queuing backtests for {len(current_population)} individuals...")
+            tasks = []
+            param_order = list(param_defs.keys())
+            backtest_count = 0
+            individuals_to_run = []
+
+            # --- Check existing logs before queueing backtests ---
+            prometheus_logger.debug("Checking logs for existing results before running backtests...")
+            # Note: _evaluate_fitness defines its *own* default_low_fitness, which is fine.
+            # We use the one defined *here* for the pre-check comparison.
+            pop_with_fitness_precheck = await self._evaluate_fitness(current_population, command_name, strategy_name)
+            needs_backtest_count = 0
+            for i, (individual, fitness) in enumerate(pop_with_fitness_precheck):
+                 # Use a small tolerance for floating point comparison
+                 if fitness <= (default_low_fitness + 1e-9): # Check against the value defined in *this* function
+                      individuals_to_run.append(individual)
+                      needs_backtest_count += 1
+                 else:
+                      prometheus_logger.debug(f"  Skipping backtest for {individual}, fitness {fitness:.3f} found in log.")
+            prometheus_logger.info(f" Need to run backtests for {needs_backtest_count}/{len(current_population)} individuals.")
+            print(f" -> Queuing {needs_backtest_count} backtests (others found in logs)...")
+            # --- End Check ---
+
+            for individual in individuals_to_run: # Only run those needing it
+                # Construct args: [ticker, strategy, period, p1_val_str, p2_val_str, ...]
+                backtest_args = [ticker, strategy_name, period] + [str(individual.get(key, '')) for key in param_order] # Use .get for safety
+                tasks.append(
+                    self.execute_and_log(command_name, args=backtest_args, called_by_user=False, internal_call=True)
+                )
+                backtest_count += 1
+                if backtest_count % 5 == 0 and needs_backtest_count > 0:
+                    print(f"    ...queued {backtest_count}/{needs_backtest_count}")
+
+
+            if tasks: # Only run gather if there are tasks
+                backtest_results = await asyncio.gather(*tasks, return_exceptions=True)
+                successful_runs = sum(1 for res in backtest_results if isinstance(res, dict) and res.get('status') == 'success')
+                print(f" -> Backtests complete ({successful_runs}/{len(tasks)} successful).")
+                failed_indices = [i for i, res in enumerate(backtest_results) if not (isinstance(res, dict) and res.get('status') == 'success')]
+                if failed_indices:
+                     # Log details about failures if possible
+                     for failed_idx in failed_indices:
+                         error_res = backtest_results[failed_idx]
+                         params_failed = individuals_to_run[failed_idx] # Get corresponding params
+                         error_msg = str(error_res) if isinstance(error_res, Exception) else (error_res.get('message', 'Unknown error') if isinstance(error_res, dict) else 'Unknown result type')
+                         prometheus_logger.warning(f"Generation {gen+1}: Backtest failed for params {params_failed}. Error: {error_msg[:200]}...") # Log params and error
+                     print(f"⚠️ {len(failed_indices)} newly run backtests failed or returned errors. Check prometheus_core.log for details.")
+
+            else:
+                print(" -> No new backtests needed for this generation.")
+
+
+            # 2b. Evaluate Fitness (using results now logged or previously found)
+            print(" -> Evaluating fitness from logs...")
+            population_with_fitness = await self._evaluate_fitness(current_population, command_name, strategy_name)
+            if not population_with_fitness: # Check if list is empty
+                print("❌ Error: Fitness evaluation returned empty results. Aborting optimization.")
+                return
+
+            current_best_individual, current_best_fitness = population_with_fitness[0]
+            print(f" -> Best Fitness (Sharpe) in Gen {gen + 1}: {current_best_fitness:.3f}")
+            print(f"    Params: {current_best_individual}")
+
+            # Update overall best
+            if current_best_fitness > best_fitness_overall:
+                best_fitness_overall = current_best_fitness
+                best_individual_overall = current_best_individual
+                print(f"    ✨ New Overall Best Found! ✨")
+
+            # 2c. Selection
+            print(f" -> Selecting {num_parents} parents...")
+            parents = self._select_parents(population_with_fitness, num_parents)
+            if not parents:
+                 print("⚠️ Warning: Parent selection yielded no parents. Stopping optimization.")
+                 break
+
+            # 2d. Crossover
+            num_offspring = population_size - len(parents) # Elitism: keep best parents
+            print(f" -> Creating {num_offspring} offspring...")
+            offspring = self._crossover(parents, num_offspring)
+
+            # 2e. Mutation
+            print(" -> Mutating offspring...")
+            mutated_offspring = self._mutate(offspring, command_name, strategy_name, mutation_rate)
+
+            # 2f. Create Next Generation
+            current_population = parents + mutated_offspring
+            print(f" -> New generation size: {len(current_population)}")
+
+
+        # 3. Report Results
+        print("\n--- Optimization Finished ---")
+        if best_individual_overall:
+            print(f"🏆 Best Parameters Found:")
+            print(json.dumps(best_individual_overall, indent=4))
+            print(f"   Best Fitness (Sharpe Ratio): {best_fitness_overall:.3f}")
+        else:
+            print("Optimization did not find a best individual (possibly all backtests failed or fitness was negative).")
+
+        prometheus_logger.info(f"GA optimization finished. Best Sharpe: {best_fitness_overall:.3f}")
+        return best_individual_overall, best_fitness_overall
+    # --- END Main GA Optimization Loop ---
+
+    # ... (rest of the Prometheus class methods remain the same) ...
     async def start_interactive_session(self):
-        # ... (start_interactive_session updated to include 'generate recipe') ...
-        print("\n--- Prometheus Meta-AI Shell ---"); print("Available commands: analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, exit"); prometheus_logger.info("Entered Prometheus interactive shell.") # Added generate recipe
+        # --- Updated command list and generate code logic ---
+        print("\n--- Prometheus Meta-AI Shell ---");
+        print("Available commands: analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, generate code <file.py> [t] [p], compare code <orig.py> <improved.py> [t] [p], optimize parameters <strat> <t> <p> [gen] [pop], test ga, exit") # Updated usage info
+        prometheus_logger.info("Entered Prometheus interactive shell.")
         while True:
             try:
                 user_input = await asyncio.to_thread(input, "Prometheus> "); user_input_lower = user_input.lower().strip(); parts = user_input.split(); cmd = parts[0].lower() if parts else ""
                 if cmd == 'exit': prometheus_logger.info("Exiting Prometheus shell."); break
                 elif cmd == "analyze" and len(parts)>1 and parts[1].lower() == "patterns": await self.analyze_workflows()
                 elif cmd == "check" and len(parts)>1 and parts[1].lower() == "correlations":
-                     print("Triggering background correlation analysis manually..."); required_funcs = [self.derivative_func, self.mlforecast_func, self.powerscore_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func]; can_run_corr = all(required_funcs)
+                     print("Triggering background correlation analysis manually..."); required_funcs = [self.derivative_func, self.mlforecast_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func]; can_run_corr = all(required_funcs)
                      if can_run_corr and (not self.correlation_task or self.correlation_task.done()): self.correlation_task = asyncio.create_task(self.background_correlation_analysis()); print("   -> Correlation task started.")
                      elif self.correlation_task and not self.correlation_task.done(): print("   -> Correlation task is already running.")
                      else: print("   -> Cannot run correlation analysis - required functions missing.")
@@ -923,15 +1843,186 @@ class Prometheus:
                 elif cmd == "generate" and len(parts)>1 and parts[1].lower() == "recipe":
                     goal_parts = parts[2:]
                     if not goal_parts: print("Please provide a goal after 'generate recipe'.")
-                    else: await self.generate_strategy_recipe(args=[" ".join(goal_parts)], called_by_user=True) # <<< Call recipe generation
-                else: print("Unknown command. Available: analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, exit") # Added generate recipe
+                    else: await self.generate_strategy_recipe(args=[" ".join(goal_parts)], called_by_user=True)
+                # --- Handle generate code command ---
+                elif cmd == "generate" and len(parts) > 1 and parts[1].lower() == "code" and len(parts) > 2:
+                    filename_to_improve = parts[2]
+                    # Optional ticker/period for comparison
+                    ticker_arg = parts[3].upper() if len(parts) > 3 else "SPY"
+                    period_arg = parts[4].lower() if len(parts) > 4 else "1y"
+
+                    print(f"--- Initiating Code Improvement for {filename_to_improve} ---")
+                    # 1. Generate Hypothesis
+                    hypothesis_result = await self.generate_improvement_hypothesis(filename_to_improve)
+                    if not (isinstance(hypothesis_result, dict) and hypothesis_result.get("status") == "success"):
+                        print(f"❌ Skipping code generation because hypothesis failed: {hypothesis_result.get('message', 'Unknown error')}")
+                        continue
+
+                    original_code = hypothesis_result.get("original_code")
+                    hypothesis_text = hypothesis_result.get("hypothesis")
+                    if not original_code or not hypothesis_text:
+                        print("❌ Error: Hypothesis generated, but original code or text missing.")
+                        continue
+
+                    # 2. Generate Improved Code (to temporary file)
+                    temp_filepath = await self._generate_improved_code(
+                        command_filename=filename_to_improve,
+                        original_code=original_code,
+                        improvement_hypothesis=hypothesis_text
+                    )
+                    if not temp_filepath:
+                        print(f"❌ Failed to generate or save improved code for {filename_to_improve}.")
+                        continue
+                    print(f"✅ Successfully generated improved code (temporary): {temp_filepath}")
+
+                    # 3. Compare Performance (if backtestable)
+                    comparison_results = None
+                    comparison_ran = False
+                    print("\n-> Checking if code is backtestable for comparison...")
+                    # Get full paths for loading check
+                    original_target_path_check = os.path.join(os.path.dirname(__file__), COMMANDS_DIR, filename_to_improve)
+                    OriginalStratClass = self._load_strategy_class_from_file(original_target_path_check)
+                    ImprovedStratClass = self._load_strategy_class_from_file(temp_filepath)
+                    
+                    # Check if both classes were loaded AND have the 'generate_signals' method
+                    is_backtestable = (OriginalStratClass and hasattr(OriginalStratClass(pd.DataFrame()), 'generate_signals') and
+                                       ImprovedStratClass and hasattr(ImprovedStratClass(pd.DataFrame()), 'generate_signals'))
+
+                    if is_backtestable:
+                        print(f"-> Files appear backtestable. Running comparison on {ticker_arg} ({period_arg})...")
+                        comparison_results = await self._compare_command_performance(
+                            original_filename=filename_to_improve,
+                            improved_filepath=temp_filepath, # Pass full temp path
+                            ticker=ticker_arg,
+                            period=period_arg
+                        )
+                        comparison_ran = True # Mark that comparison was attempted
+                        if not comparison_results:
+                            print("⚠️ Comparison failed or produced no results.")
+                    else:
+                        print("-> Files do not appear to be standard backtest strategies. Skipping performance comparison.")
+                        print("   (Generated code saved temporarily. Review manually.)")
+
+                    # 4. Ask for Confirmation to Overwrite
+                    print("\n--- Confirmation ---")
+                    original_target_path = os.path.join(os.path.dirname(__file__), COMMANDS_DIR, filename_to_improve)
+                    prompt_message = f"❓ Overwrite original file '{original_target_path}' with the improved version? (yes/no): "
+                    confirm = await asyncio.to_thread(input, prompt_message)
+
+                    if confirm.lower() == 'yes':
+                        try:
+                            # --- Overwrite Logic ---
+                            print(f"   -> Overwriting '{original_target_path}'...")
+                            # Use shutil.move for atomic operation (rename/overwrite)
+                            shutil.move(temp_filepath, original_target_path)
+                            print(f"✅ Original file overwritten successfully.")
+                            prometheus_logger.info(f"User confirmed overwrite for {filename_to_improve}.")
+                        except Exception as e_move:
+                            print(f"❌ Error overwriting file: {e_move}")
+                            prometheus_logger.error(f"Error moving {temp_filepath} to {original_target_path}: {e_move}")
+                            # Keep temp file if move failed
+                            print(f"   -> Improved code remains available at: {temp_filepath}")
+
+                    else:
+                        # --- Cancelled Overwrite ---
+                        print("   -> Overwrite cancelled.")
+                        # Keep temp file for manual review
+                        print(f"   -> Improved code remains available at: {temp_filepath}")
+                        prometheus_logger.info(f"User cancelled overwrite for {filename_to_improve}. Temp file: {temp_filepath}")
+
+                # --- Handle compare code command ---
+                elif cmd == "compare" and len(parts) > 1 and parts[1].lower() == "code" and len(parts) > 3:
+                    original_file = parts[2]
+                    # Allow comparing file from improved_commands dir or commands dir
+                    improved_file_basename = parts[3]
+                    improved_file_path = os.path.join(os.path.dirname(__file__), IMPROVED_CODE_DIR, improved_file_basename)
+                    if not os.path.exists(improved_file_path):
+                         alt_path = os.path.join(os.path.dirname(__file__), COMMANDS_DIR, improved_file_basename)
+                         if os.path.exists(alt_path):
+                              improved_file_path = alt_path
+                         else:
+                              print(f"❌ Error: File '{improved_file_basename}' not found in '{IMPROVED_CODE_DIR}' or '{COMMANDS_DIR}'.")
+                              continue
+
+                    ticker_arg = parts[4].upper() if len(parts) > 4 else "SPY"
+                    period_arg = parts[5].lower() if len(parts) > 5 else "1y"
+                    await self._compare_command_performance(original_file, improved_file_path, ticker=ticker_arg, period=period_arg)
+
+                # --- Handle optimize parameters command ---
+                elif cmd == "optimize" and len(parts) > 1 and parts[1].lower() == "parameters" and len(parts) > 4:
+                    # Usage: optimize parameters <strategy_name> <ticker> <period> [generations] [population_size]
+                    strategy_arg = parts[2].lower()
+                    ticker_arg = parts[3].upper()
+                    period_arg = parts[4].lower()
+                    try:
+                        generations_arg = int(parts[5]) if len(parts) > 5 else 10 # Default 10 generations
+                        population_size_arg = int(parts[6]) if len(parts) > 6 else 20 # Default 20 population
+                        num_parents_arg = population_size_arg // 2 # Keep top 50%
+                    except ValueError:
+                         print("❌ Error: Generations and population size must be integers.")
+                         continue
+
+                    # Validate strategy is optimizable for /backtest
+                    optimizable_strategies = self.optimizable_params_config.get("/backtest", {}).keys()
+                    if strategy_arg not in optimizable_strategies:
+                        print(f"❌ Error: Strategy '{strategy_arg}' is not defined as optimizable in {OPTIMIZABLE_PARAMS_FILE} for /backtest.")
+                        continue
+
+                    # Run the optimization
+                    await self.run_parameter_optimization(
+                        command_name="/backtest",
+                        strategy_name=strategy_arg,
+                        ticker=ticker_arg,
+                        period=period_arg,
+                        generations=generations_arg,
+                        population_size=population_size_arg,
+                        num_parents=num_parents_arg
+                    )
+
+                # --- Handle Test GA command ---
+                elif cmd == "test" and len(parts) > 1 and parts[1].lower() == "ga":
+                    print("\n--- Testing Genetic Algorithm Core Functions ---")
+                    test_command = "/backtest"
+                    test_strategy = "rsi"
+                    pop_size = 10
+                    print(f"1. Generating initial population for {test_command}/{test_strategy} (size={pop_size})...")
+                    initial_pop = self._generate_initial_population(test_command, test_strategy, pop_size)
+                    if not initial_pop: print("   -> Failed to generate population."); continue
+                    print(f"   -> Generated {len(initial_pop)} individuals. Example: {initial_pop[0]}")
+                    print("\n2. Evaluating fitness (using DB scores if available)...")
+                    pop_with_fitness = await self._evaluate_fitness(initial_pop, test_command, test_strategy)
+                    if not pop_with_fitness: print("   -> Fitness evaluation failed."); continue
+                    if not pop_with_fitness:
+                         print("   -> No individuals after fitness evaluation.")
+                         continue
+                    print(f"   -> Top individual: {pop_with_fitness[0][0]} (Fitness: {pop_with_fitness[0][1]:.3f})")
+                    print(f"   -> Bottom individual: {pop_with_fitness[-1][0]} (Fitness: {pop_with_fitness[-1][1]:.3f})")
+
+                    num_parents_to_select = len(pop_with_fitness) // 2
+                    print(f"\n3. Selecting top {num_parents_to_select} parents...")
+                    parents = self._select_parents(pop_with_fitness, num_parents_to_select)
+                    if not parents: print("   -> Parent selection failed."); continue
+                    print(f"   -> Selected {len(parents)} parents. Example parent: {parents[0]}")
+                    num_offspring = pop_size - len(parents)
+                    print(f"\n4. Creating {num_offspring} offspring via crossover...")
+                    offspring = self._crossover(parents, num_offspring)
+                    if not offspring: print("   -> Crossover failed or produced no offspring."); offspring = []
+                    
+                    print("\n5. Mutating offspring...")
+                    mutated_offspring = self._mutate(offspring, test_command, test_strategy, mutation_rate=0.2)
+                    if not mutated_offspring: print("   -> Mutation produced no offspring."); mutated_offspring = []
+                    else: print(f"   -> Mutation complete. Example mutated offspring: {mutated_offspring[0]}")
+
+                    next_generation = parents + mutated_offspring
+                    print(f"\n-> Next generation size: {len(next_generation)}")
+                    print("--- GA Test Complete ---")
+                else: print("Unknown command. Available: analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, generate code <file.py> [t] [p], compare code <orig.py> <improved.py> [t] [p], optimize parameters <strat> <t> <p> [gen] [pop], test ga, exit")
             except EOFError: prometheus_logger.warning("EOF received, exiting Prometheus shell."); break
             except Exception as e: prometheus_logger.exception(f"Error in Prometheus shell: {e}"); print(f"Error: {e}")
         print("Returning to M.I.C. Singularity main shell.")
-
-
+        
     async def _query_log_db(self, limit: int = 10):
-         # (Keep existing implementation)
+         # ... (implementation remains the same) ...
          print(f"\n--- Recent Command Logs (Last {limit}) ---")
          try:
              conn = sqlite3.connect(self.db_path); conn.row_factory = sqlite3.Row; cursor = conn.cursor(); cursor.execute("SELECT id, timestamp, command, parameters, success, duration_ms, output_summary FROM command_log ORDER BY id DESC LIMIT ?", (limit,)); rows = cursor.fetchall(); conn.close()
@@ -939,7 +2030,6 @@ class Prometheus:
              log_data = []; headers = ["ID", "Timestamp", "Success", "Duration", "Command", "Parameters", "Summary"]
              for row in reversed(rows):
                  ts = datetime.fromisoformat(row['timestamp']).strftime('%H:%M:%S');
-                 # --- MODIFICATION: Removed emojis ---
                  success_str = "OK" if row['success'] else "FAIL"; params_str = "<err>"
                  try:
                      params_data = json.loads(row['parameters'])
@@ -952,3 +2042,9 @@ class Prometheus:
                  log_data.append([row['id'], ts, success_str, f"{row['duration_ms']}ms", row['command'], params_str_trunc, summary_str_trunc])
              print(tabulate(log_data, headers=headers, tablefmt="grid"))
          except Exception as e: prometheus_logger.exception(f"Error querying log db: {e}"); print(f"Error: {e}")
+
+# Need BaseStrategy for type checking in _load_strategy_class_from_file
+try: from dev_command import BaseStrategy # type: ignore
+except ImportError:
+    prometheus_logger.warning("BaseStrategy not found, defining a dummy class for type checking.")
+    class BaseStrategy: pass
