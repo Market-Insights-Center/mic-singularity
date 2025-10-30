@@ -27,6 +27,7 @@ SYNTHESIZED_WORKFLOWS_FILE = 'synthesized_workflows.json'
 IMPROVED_CODE_DIR = 'improved_commands' # Directory for generated code
 COMMANDS_DIR = 'Isolated Commands' # Directory for original commands
 OPTIMIZABLE_PARAMS_FILE = 'optimizable_parameters.json' # <-- NEW CONFIG FILE
+PROMETHEUS_STATE_FILE = 'prometheus_state.json'
 
 # --- Prometheus Core Logger ---
 prometheus_logger = logging.getLogger('PROMETHEUS_CORE')
@@ -175,11 +176,20 @@ class Prometheus:
                  powerscore_func: Callable, sentiment_func: Callable,
                  fundamentals_func: Callable, quickscore_func: Callable):
         prometheus_logger.info("Initializing Prometheus Core...")
-        self.db_path = "prometheus_kb.sqlite"; self._initialize_db(); self.toolbox = toolbox_map
+        self.db_path = "prometheus_kb.sqlite"; self._initialize_db()
+
+        # --- MODIFIED: Additions for status toggle ---
+        self.is_active = self._load_prometheus_state() # Load saved state
+        print(f"   -> Prometheus Core: Initializing in {'ACTIVE' if self.is_active else 'INACTIVE'} state.")
+        self.base_toolbox = toolbox_map.copy() # Store original commands
+        self.toolbox = toolbox_map # This map will be modified with synthesized commands
+        # --- END MODIFIED ---
+
         self.risk_command_func = risk_command_func; self.derivative_func = derivative_func; self.mlforecast_func = mlforecast_func
         self.screener_func = screener_func; self.powerscore_func = powerscore_func; self.sentiment_func = sentiment_func
         self.fundamentals_func = fundamentals_func; self.quickscore_func = quickscore_func
         self.gemini_model = None; self.gemini_api_key = gemini_api_key; self.synthesized_commands = set()
+        
         if gemini_api_key and "AIza" in gemini_api_key:
              try:
                  genai.configure(api_key=gemini_api_key)
@@ -189,13 +199,47 @@ class Prometheus:
              except Exception as e: prometheus_logger.error(f"Gemini init failed: {e}"); print(f"   -> Prometheus Core: Warn - Gemini init failed: {e}")
         else: prometheus_logger.warning("Gemini API key missing/invalid."); print("   -> Prometheus Core: Warn - Gemini API key missing/invalid.")
 
-        self._load_and_register_synthesized_commands_sync()
+        # self._load_and_register_synthesized_commands_sync() # <-- This line is moved
         self._load_optimizable_params()
 
+        # --- MODIFIED: Conditional loading and tasks based on self.is_active ---
         required_funcs = [self.derivative_func, self.mlforecast_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func] # Removed powerscore temporarily
-        if all(required_funcs): self.correlation_task = asyncio.create_task(self.background_correlation_analysis()); prometheus_logger.info("BG correlation task started."); print("   -> Prometheus Core: Background correlation task started.")
-        else: missing = [f.__name__ for f, func in zip(["deriv", "mlfcst", "sent", "fund", "qscore"], required_funcs) if not func]; self.correlation_task = None; prometheus_logger.warning(f"BG correlation task NOT started (missing: {', '.join(missing)})."); print(f"   -> Prometheus Core: BG correlation task NOT started (missing: {', '.join(missing)}).")
+        
+        if self.is_active:
+            self._load_and_register_synthesized_commands_sync()
+            if all(required_funcs): 
+                self.correlation_task = asyncio.create_task(self.background_correlation_analysis())
+                prometheus_logger.info("BG correlation task started."); print("   -> Prometheus Core: Background correlation task started.")
+            else: 
+                missing = [f.__name__ for f, func in zip(["deriv", "mlfcst", "sent", "fund", "qscore"], required_funcs) if not func]
+                self.correlation_task = None
+                prometheus_logger.warning(f"BG correlation task NOT started (missing: {', '.join(missing)})."); print(f"   -> Prometheus Core: BG correlation task NOT started (missing: {', '.join(missing)}).")
+        else:
+            prometheus_logger.info("Prometheus initialized in INACTIVE state. No background tasks or synthesized commands loaded.")
+            self.correlation_task = None
+        # --- END MODIFIED ---
+            
         os.makedirs(IMPROVED_CODE_DIR, exist_ok=True)
+
+    def _load_prometheus_state(self) -> bool:
+        """Loads the active/inactive state from a JSON file. Defaults to True."""
+        try:
+            if os.path.exists(PROMETHEUS_STATE_FILE):
+                with open(PROMETHEUS_STATE_FILE, 'r') as f:
+                    state = json.load(f)
+                    return state.get("is_active", True)
+        except (IOError, json.JSONDecodeError) as e:
+            prometheus_logger.warning(f"Could not load Prometheus state file: {e}. Defaulting to ON.")
+        return True # Default to ON
+
+    def _save_prometheus_state(self):
+        """Saves the current active/inactive state to a JSON file."""
+        try:
+            with open(PROMETHEUS_STATE_FILE, 'w') as f:
+                json.dump({"is_active": self.is_active}, f, indent=4)
+            prometheus_logger.info(f"Saved Prometheus state (is_active: {self.is_active}) to {PROMETHEUS_STATE_FILE}")
+        except IOError as e:
+            prometheus_logger.error(f"Failed to save Prometheus state: {e}")
 
     def _initialize_db(self):
         # ... (implementation remains the same, including backtest columns) ...
@@ -383,8 +427,13 @@ class Prometheus:
         except Exception as e: prometheus_logger.exception(f"Error loading synthesized workflows sync: {e}"); print(f"   -> Prometheus Core: [ERROR] loading workflows sync: {e}")
 
     async def get_market_context(self) -> Dict[str, Any]:
-        # ... (implementation remains the same) ...
         """ Fetches market context including risk scores and % changes with enhanced logging. """
+        # --- NEW: Check if Prometheus is active ---
+        if not self.is_active:
+            prometheus_logger.debug("get_market_context: Prometheus is INACTIVE. Skipping context fetch.")
+            return {}
+        # --- END NEW ---
+        
         prometheus_logger.info("Starting context fetch...")
         print("[CONTEXT DEBUG] Starting context fetch...") # <<< DEBUG
         context: Dict[str, Any] = {"vix_price": "N/A", "spy_score": "N/A", "spy_changes": {}, "vix_changes": {}}
@@ -512,11 +561,14 @@ class Prometheus:
         prometheus_logger.info(f"Final market context: VIX={context['vix_price']}, Score={context['spy_score']}")
         print(f"[CONTEXT DEBUG] Final context: VIX={context['vix_price']}, Score={context['spy_score']}")
         return context
-
+    
     async def execute_and_log(self, command_name_with_slash: str, args: List[str] = None, ai_params: Optional[Dict] = None, called_by_user: bool = False, internal_call: bool = False) -> Any:
         # ... (implementation remains the same, including backtest metric extraction) ...
         start_time = datetime.now(); command_name = command_name_with_slash.lstrip('/'); context = {}
+        # --- MODIFICATION: get_market_context() will now handle self.is_active check ---
         if not internal_call: context = await self.get_market_context()
+        # --- END MODIFICATION ---
+        
         command_func = self.toolbox.get(command_name); log_id = None
         if not command_func:
             output_summary = f"Unknown command '{command_name_with_slash}'"; prometheus_logger.error(output_summary); print(output_summary)
@@ -525,7 +577,16 @@ class Prometheus:
             return {"status": "error", "message": output_summary}
 
         parameters_to_log = args if called_by_user and args is not None else ai_params
-        context_str_log = "Context N/A (Internal Call)" if internal_call else ", ".join([f"{k}:{str(v)[:20]}{'...' if len(str(v))>20 else ''}" for k,v in context.items()])
+        
+        # --- MODIFICATION: Context log message now handles potentially empty context ---
+        context_str_log = "Context N/A (Internal Call)"
+        if not internal_call:
+            if context: # Only build string if context is not empty
+                 context_str_log = ", ".join([f"{k}:{str(v)[:20]}{'...' if len(str(v))>20 else ''}" for k,v in context.items()])
+            else: # Handle empty context (e.g., Prometheus is OFF)
+                 context_str_log = "Context N/A (Prometheus Inactive)" if not self.is_active else "Context N/A (Fetch Failed)"
+        # --- END MODIFICATION ---
+                 
         param_str = ' '.join(map(str, args)) if called_by_user and args else json.dumps(ai_params) if ai_params else ""
         log_msg_start = f"Executing: {command_name_with_slash} {param_str} | Context: {context_str_log}"; prometheus_logger.info(log_msg_start)
         is_synthesis_execution = command_name.startswith("synthesized_")
@@ -628,8 +689,11 @@ class Prometheus:
                      backtest_metrics=backtest_metrics_for_log # Pass the dict here
                  )
                  if called_by_user and log_id is not None: print(f"[Prometheus Action ID: {log_id}]")
-                 if success_flag and called_by_user and not internal_call and not is_synthesis_execution and random.random() < 0.1:
+                 
+                 # --- MODIFIED: Check self.is_active before analyzing workflows ---
+                 if self.is_active and called_by_user and not internal_call and not is_synthesis_execution and random.random() < 0.1:
                      await self.analyze_workflows()
+                 # --- END MODIFIED ---
 
         # --- Return adjusted result for backtest ---
         if command_name == "backtest" and isinstance(result, dict) and result.get("status") == "success":
@@ -637,7 +701,7 @@ class Prometheus:
         elif result is None and success_flag:
              return {"status": "success", "summary": output_summary}
         return result
-
+    
     def _log_command(self, timestamp: datetime, command: str, parameters: Any, context: Dict[str, Any], output_summary: str, success: bool = True, duration_ms: int = 0, backtest_metrics: Optional[Dict] = None) -> Optional[int]:
         # ... (implementation remains the same) ...
         params_str = json.dumps(parameters, default=str) if isinstance(parameters, (dict, list)) else str(parameters); context_str = json.dumps(context, default=str)
@@ -1825,27 +1889,102 @@ class Prometheus:
     # ... (rest of the Prometheus class methods remain the same) ...
     async def start_interactive_session(self):
         # --- Updated command list and generate code logic ---
+        
+        # --- MODIFIED: Added 'status' to the help text ---
         print("\n--- Prometheus Meta-AI Shell ---");
-        print("Available commands: analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, generate code <file.py> [t] [p], compare code <orig.py> <improved.py> [t] [p], optimize parameters <strat> <t> <p> [gen] [pop], test ga, exit") # Updated usage info
+        print("Available commands: status, analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, generate code <file.py> [t] [p], compare code <orig.py> <improved.py> [t] [p], optimize parameters <strat> <t> <p> [gen] [pop], test ga, exit") # Updated usage info
+        # --- END MODIFIED ---
+        
         prometheus_logger.info("Entered Prometheus interactive shell.")
         while True:
             try:
-                user_input = await asyncio.to_thread(input, "Prometheus> "); user_input_lower = user_input.lower().strip(); parts = user_input.split(); cmd = parts[0].lower() if parts else ""
+                # --- MODIFIED: Added status to prompt ---
+                active_str = "ACTIVE" if self.is_active else "INACTIVE"
+                user_input = await asyncio.to_thread(input, f"Prometheus ({active_str})> "); 
+                # --- END MODIFIED ---
+                
+                user_input_lower = user_input.lower().strip(); parts = user_input.split(); cmd = parts[0].lower() if parts else ""
+                
                 if cmd == 'exit': prometheus_logger.info("Exiting Prometheus shell."); break
-                elif cmd == "analyze" and len(parts)>1 and parts[1].lower() == "patterns": await self.analyze_workflows()
+                
+                # --- NEW: Handle status command ---
+                elif cmd == "status":
+                    current_status_str = "ON" if self.is_active else "OFF"
+                    status_input = await asyncio.to_thread(input, f"Prometheus is currently {current_status_str}. Set status (1=ON, 0=OFF): ")
+                    
+                    if status_input == "0":
+                        if not self.is_active:
+                            print("Prometheus is already OFF.")
+                        else:
+                            print("Deactivating Prometheus...")
+                            self.is_active = False
+                            if self.correlation_task and not self.correlation_task.done():
+                                self.correlation_task.cancel()
+                                print("   -> Background correlation task cancelled.")
+                            self.correlation_task = None
+                            # Remove synthesized commands
+                            self.toolbox = self.base_toolbox.copy()
+                            self.synthesized_commands.clear()
+                            print("   -> Synthesized commands unloaded.")
+                            print("   -> Context fetching and workflow analysis disabled.")
+                            self._save_prometheus_state() # Save state
+                            
+                    elif status_input == "1":
+                        if self.is_active:
+                            print("Prometheus is already ON.")
+                        else:
+                            print("Activating Prometheus...")
+                            self.is_active = True
+                            
+                            # Restart background task
+                            # (Need to copy this check from __init__)
+                            required_funcs = [self.derivative_func, self.mlforecast_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func]
+                            if all(required_funcs):
+                                if not self.correlation_task or self.correlation_task.done():
+                                    self.correlation_task = asyncio.create_task(self.background_correlation_analysis())
+                                    print("   -> Background correlation task started.")
+                                else:
+                                    print("   -> Background correlation task is already running.")
+                            else:
+                                missing = [f.__name__ for f, func in zip(["deriv", "mlfcst", "sent", "fund", "qscore"], required_funcs) if not func]
+                                print(f"   -> Background correlation task NOT started (missing: {', '.join(missing)}).")
+                                
+                            # Reload synthesized commands
+                            self._load_and_register_synthesized_commands_sync()
+                            print("   -> Synthesized commands loaded.")
+                            print("   -> Context fetching and workflow analysis enabled.")
+                            self._save_prometheus_state() # Save state
+                    else:
+                        print("Invalid input. Status unchanged.")
+                    continue # Go back to prompt
+                # --- END NEW ---
+                    
+                elif cmd == "analyze" and len(parts)>1 and parts[1].lower() == "patterns": 
+                    if not self.is_active: print("   -> Cannot analyze patterns. Prometheus is INACTIVE."); continue
+                    await self.analyze_workflows()
                 elif cmd == "check" and len(parts)>1 and parts[1].lower() == "correlations":
-                     print("Triggering background correlation analysis manually..."); required_funcs = [self.derivative_func, self.mlforecast_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func]; can_run_corr = all(required_funcs)
+                     print("Triggering background correlation analysis manually..."); 
+                     # --- MODIFIED: Check if active ---
+                     if not self.is_active:
+                         print("   -> Cannot check correlations. Prometheus is INACTIVE.")
+                         continue
+                     # --- END MODIFIED ---
+                     required_funcs = [self.derivative_func, self.mlforecast_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func]; can_run_corr = all(required_funcs)
                      if can_run_corr and (not self.correlation_task or self.correlation_task.done()): self.correlation_task = asyncio.create_task(self.background_correlation_analysis()); print("   -> Correlation task started.")
                      elif self.correlation_task and not self.correlation_task.done(): print("   -> Correlation task is already running.")
                      else: print("   -> Cannot run correlation analysis - required functions missing.")
                 elif cmd == "query" and len(parts)>1 and parts[1].lower() == "log": limit = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 10; await self._query_log_db(limit)
-                elif cmd == "generate" and len(parts)>1 and parts[1].lower() == "memo": await self.generate_market_memo()
+                elif cmd == "generate" and len(parts)>1 and parts[1].lower() == "memo": 
+                    if not self.is_active: print("   -> Cannot generate memo. Prometheus is INACTIVE."); continue
+                    await self.generate_market_memo()
                 elif cmd == "generate" and len(parts)>1 and parts[1].lower() == "recipe":
+                    if not self.is_active: print("   -> Cannot generate recipe. Prometheus is INACTIVE."); continue
                     goal_parts = parts[2:]
                     if not goal_parts: print("Please provide a goal after 'generate recipe'.")
                     else: await self.generate_strategy_recipe(args=[" ".join(goal_parts)], called_by_user=True)
                 # --- Handle generate code command ---
                 elif cmd == "generate" and len(parts) > 1 and parts[1].lower() == "code" and len(parts) > 2:
+                    if not self.is_active: print("   -> Cannot generate code. Prometheus is INACTIVE."); continue
                     filename_to_improve = parts[2]
                     # Optional ticker/period for comparison
                     ticker_arg = parts[3].upper() if len(parts) > 3 else "SPY"
@@ -1932,6 +2071,7 @@ class Prometheus:
 
                 # --- Handle compare code command ---
                 elif cmd == "compare" and len(parts) > 1 and parts[1].lower() == "code" and len(parts) > 3:
+                    if not self.is_active: print("   -> Cannot compare code. Prometheus is INACTIVE."); continue
                     original_file = parts[2]
                     # Allow comparing file from improved_commands dir or commands dir
                     improved_file_basename = parts[3]
@@ -1950,6 +2090,7 @@ class Prometheus:
 
                 # --- Handle optimize parameters command ---
                 elif cmd == "optimize" and len(parts) > 1 and parts[1].lower() == "parameters" and len(parts) > 4:
+                    if not self.is_active: print("   -> Cannot optimize parameters. Prometheus is INACTIVE."); continue
                     # Usage: optimize parameters <strategy_name> <ticker> <period> [generations] [population_size]
                     strategy_arg = parts[2].lower()
                     ticker_arg = parts[3].upper()
@@ -1981,6 +2122,7 @@ class Prometheus:
 
                 # --- Handle Test GA command ---
                 elif cmd == "test" and len(parts) > 1 and parts[1].lower() == "ga":
+                    if not self.is_active: print("   -> Cannot test GA. Prometheus is INACTIVE."); continue
                     print("\n--- Testing Genetic Algorithm Core Functions ---")
                     test_command = "/backtest"
                     test_strategy = "rsi"
@@ -2016,7 +2158,10 @@ class Prometheus:
                     next_generation = parents + mutated_offspring
                     print(f"\n-> Next generation size: {len(next_generation)}")
                     print("--- GA Test Complete ---")
-                else: print("Unknown command. Available: analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, generate code <file.py> [t] [p], compare code <orig.py> <improved.py> [t] [p], optimize parameters <strat> <t> <p> [gen] [pop], test ga, exit")
+                else: 
+                    # --- MODIFIED: Added 'status' to help text ---
+                    print("Unknown command. Available: status, analyze patterns, check correlations, query log <limit>, generate memo, generate recipe, generate code <file.py> [t] [p], compare code <orig.py> <improved.py> [t] [p], optimize parameters <strat> <t> <p> [gen] [pop], test ga, exit")
+                    # --- END MODIFIED ---
             except EOFError: prometheus_logger.warning("EOF received, exiting Prometheus shell."); break
             except Exception as e: prometheus_logger.exception(f"Error in Prometheus shell: {e}"); print(f"Error: {e}")
         print("Returning to M.I.C. Singularity main shell.")
