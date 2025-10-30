@@ -364,6 +364,15 @@ async def handle_strategy_recipe_command(args: List[str], ai_params: Optional[Di
     # Pass necessary dependencies (Prometheus instance, Gemini model)
     return await prometheus_instance.generate_strategy_recipe(args, ai_params, is_called_by_ai, prometheus_instance, gemini_model_obj)
 
+# --- NEW: Improvement Proposal Command Handler ---
+async def handle_propose_improvement_command(args: List[str], ai_params: Optional[Dict] = None, is_called_by_ai: bool = False, prometheus_instance: Prometheus = None, gemini_model_obj: Any = None):
+    """Wrapper function to call the improvement proposal logic within the Prometheus instance."""
+    if not prometheus_instance:
+        print("Error: Prometheus instance not available for improvement proposal.")
+        return {"status": "error", "message": "Prometheus instance missing."}
+    # Pass necessary dependencies (Prometheus instance, Gemini model)
+    # Note: 'called_by_user' will be set correctly by Prometheus.execute_and_log
+    return await prometheus_instance.analyze_and_propose_improvement(args=args, ai_params=ai_params, is_called_by_ai=is_called_by_ai, prometheus_instance=prometheus_instance, gemini_model_obj=gemini_model_obj)
 
 # --- Tool Box Map Definition ---
 TOOLBOX_MAP: Dict[str, Callable] = {
@@ -404,7 +413,8 @@ TOOLBOX_MAP: Dict[str, Callable] = {
     "dev": handle_dev_command,
     "help": handle_help_command,
     "memo": handle_memo_command,
-    "strategy_recipe": handle_strategy_recipe_command, # <<< Added strategy recipe handler
+    "strategy_recipe": handle_strategy_recipe_command,
+    "propose_improvement": handle_propose_improvement_command, # <<< Added improvement proposal handler
 }
 
 # --- Core Application Logic ---
@@ -413,18 +423,16 @@ async def main_singularity():
     global gemini_model, tts_engine, AVAILABLE_PYTHON_FUNCTIONS
     global COMMAND_STATES_CACHE
 
-    # Initialize AI Components (Gemini Model, TTS, Function Mapping for AI)
-    # This now returns the initialized components.
-    # Pass globals() so initialize_ai_components can find the handler functions by name.
-    # Suppress potential noisy output from initialization
+    # ... (Initialization code remains the same up to func_to_command_map) ...
+    # Initialize AI Components
     with suppress_output():
         gemini_model, tts_engine, AVAILABLE_PYTHON_FUNCTIONS = initialize_ai_components(GEMINI_API_KEY, globals())
 
-    # Initialize Counter and Alerts (after AI components)
+    # Initialize Counter and Alerts
     await initialize_counter_files()
-    await load_alerts_from_csv() # Load alerts before starting worker
+    await load_alerts_from_csv()
 
-    # --- Initialize Prometheus Core ---
+    # Initialize Prometheus Core
     print("-> Initializing Project Prometheus Core...")
     prometheus = Prometheus(
         gemini_api_key=GEMINI_API_KEY,
@@ -433,7 +441,6 @@ async def main_singularity():
         derivative_func=handle_derivative_command,
         mlforecast_func=handle_mlforecast_command,
         screener_func=find_and_screen_stocks,
-        # --- Make sure these are passed if available ---
         powerscore_func=handle_powerscore_command,
         sentiment_func=handle_sentiment_command,
         fundamentals_func=handle_fundamentals_command,
@@ -441,22 +448,25 @@ async def main_singularity():
     )
     print("   -> Prometheus Core is active.")
 
-    # --- Post-Prometheus Initial Setup ---
-    # Ensure GICS DB exists (Prometheus might use it indirectly via screener)
+    # Post-Prometheus Initial Setup
     gics_db_path = os.path.join(os.path.dirname(__file__), 'gics_database.txt')
     if not os.path.exists(gics_db_path):
-         # Define build_gics_database_file if it's not already globally available
-         # For now, assuming it exists or handle_dev_command imports it.
-         # await asyncio.to_thread(build_gics_database_file, gics_db_path) # Example call
          print(f"Warning: GICS database '{gics_db_path}' not found. Screener functionality might be affected.")
 
-
     command_states = load_command_states()
-    COMMAND_STATES_CACHE = command_states # Cache the loaded states
+    COMMAND_STATES_CACHE = command_states
 
     display_welcome_message(command_states)
     display_utility_commands_only()
-    alert_task = asyncio.create_task(alert_worker()) # Start alert worker
+    alert_task = asyncio.create_task(alert_worker())
+
+    func_to_command_map = {func.__name__: f"/{cmd_name}" for cmd_name, func in TOOLBOX_MAP.items()} # Use full command path
+    for py_func_name, py_func_obj in AVAILABLE_PYTHON_FUNCTIONS.items():
+        if py_func_name not in func_to_command_map:
+             derived_cmd_name = py_func_name.replace("handle_", "").replace("_command", "").replace("_tool","")
+             # Ensure func_to_command_map stores the command *with* the slash if that's how Prometheus expects it
+             func_to_command_map[py_func_name] = f"/{derived_cmd_name}"
+
 
     # --- Main Input Loop ---
     while True:
@@ -474,7 +484,7 @@ async def main_singularity():
                     print("AI chat session ended by user. History cleared.")
                     AI_CONVERSATION_HISTORY.clear()
                     CURRENT_AI_SESSION_ORIGINAL_REQUEST = None
-                    AI_INTERNAL_STEP_COUNT = 0 # Reset AI state if needed
+                    AI_INTERNAL_STEP_COUNT = 0
                 else:
                     print("No active AI chat session to end.")
                 continue
@@ -494,68 +504,70 @@ async def main_singularity():
             # --- Special Commands (Not Routed Through Prometheus Toolbox) ---
             if command_with_slash == "/exit":
                 print("Exiting Market Insights Center Singularity. Goodbye!")
-                # Cancel background tasks gracefully
                 alert_task.cancel()
                 if prometheus.correlation_task:
                      prometheus.correlation_task.cancel()
-                break # Exit the main loop
+                break
 
-            elif command_with_slash == "/prometheus": # New command for direct interaction
+            elif command_with_slash == "/prometheus":
                 await prometheus.start_interactive_session()
-                # Loop continues after returning from the session
+                continue # Continue loop after shell exits
 
             elif command_with_slash == "/ai":
                  user_natural_prompt = " ".join(args)
                  if not user_natural_prompt:
                      print("Usage: /ai <your request or question for the AI assistant>")
                  else:
-                     await increment_command_count(command_with_slash) # Count AI command
-                     # Optional: Log AI initiation via Prometheus (less detail than tool calls)
-                     # await prometheus._log_command(datetime.now(), "/ai_initiate", args, {}, "AI prompt received.", duration_ms=0)
+                     print("[DEBUG] Routing to explicit /ai handler...") # DEBUG
+                     await increment_command_count(command_with_slash)
                      await handle_ai_prompt(
                          user_new_message=user_natural_prompt,
-                         is_new_session=True, # Start new session for explicit /ai call
+                         is_new_session=True,
                          original_session_request=user_natural_prompt,
                          conversation_history=AI_CONVERSATION_HISTORY,
                          gemini_model_obj=gemini_model,
                          available_functions=AVAILABLE_PYTHON_FUNCTIONS,
                          session_request_obj={'value': CURRENT_AI_SESSION_ORIGINAL_REQUEST},
-                         step_count_obj={'value': AI_INTERNAL_STEP_COUNT}
+                         step_count_obj={'value': AI_INTERNAL_STEP_COUNT},
+                         prometheus_obj=prometheus,
+                         func_to_command_map=func_to_command_map
                      )
-                 continue # Skip Prometheus logging for the /ai wrapper itself
+                 continue
 
             elif command_with_slash == "/voice":
-                 await increment_command_count(command_with_slash) # Count voice command
-                 # Optional: Log voice initiation
-                 # await prometheus._log_command(datetime.now(), "/voice_initiate", [], {}, "Voice command received.", duration_ms=0)
+                 print("[DEBUG] Routing to /voice handler...") # DEBUG
+                 await increment_command_count(command_with_slash)
                  await handle_voice_command(
                      conversation_history=AI_CONVERSATION_HISTORY,
                      gemini_model_obj=gemini_model,
                      available_functions=AVAILABLE_PYTHON_FUNCTIONS,
                      tts_engine_obj=tts_engine,
                      session_request_obj={'value': CURRENT_AI_SESSION_ORIGINAL_REQUEST},
-                     step_count_obj={'value': AI_INTERNAL_STEP_COUNT}
+                     step_count_obj={'value': AI_INTERNAL_STEP_COUNT},
+                     prometheus_obj=prometheus,
+                     func_to_command_map=func_to_command_map
                  )
-                 continue # Skip Prometheus logging for the /voice wrapper
+                 continue
 
             # --- Command Routing Through Prometheus ---
             else:
-                 # Check if it looks like a command
+                 # --- *** FIX: Check ONLY for '/' prefix here *** ---
                  if user_input_full_line.startswith("/"):
+                     print(f"[DEBUG] Input starts with '/', routing to Prometheus: {command_with_slash}...") # DEBUG
                      # Check Usage Limit and Command State FIRST
                      if not check_usage_limit(command_with_slash):
-                         continue # Limit reached message printed by check_usage_limit
+                         continue
 
-                     core_commands = ['help', 'exit', 'dev', 'prometheus'] # Commands handled outside toolbox check or directly above
-                     if not COMMAND_STATES_CACHE: # Load if cache is empty
+                     core_commands = ['help', 'exit', 'dev', 'prometheus', 'ai', 'voice'] # Updated core list
+                     if not COMMAND_STATES_CACHE:
                           COMMAND_STATES_CACHE = load_command_states()
                      enabled_commands = COMMAND_STATES_CACHE.get('commands', {})
 
-                     # Check if command is enabled (excluding core commands already handled)
+                     # Check if command is enabled
                      if command_name_no_slash not in core_commands and not enabled_commands.get(command_name_no_slash, True):
                           disabled_message_template = COMMAND_STATES_CACHE.get('disabled_command_message', "Command '/{command}' is disabled.")
                           print(disabled_message_template.format(command=command_name_no_slash))
-                          continue # Command disabled
+                          continue
 
                      # Determine command to log (handle /assess subcommands)
                      command_to_log = command_with_slash
@@ -564,22 +576,21 @@ async def main_singularity():
                          if sub_command in ['A', 'B', 'C', 'D', 'E']:
                              command_to_log = f"/assess {sub_command}"
 
-                     # Increment Count (Do this *before* execution attempt)
+                     # Increment Count
                      await increment_command_count(command_to_log)
 
                      # Execute via Prometheus if it's in the toolbox
                      if command_name_no_slash in prometheus.toolbox:
+                         print(f"[DEBUG] Calling Prometheus execute_and_log for: {command_with_slash}...") # DEBUG
                          await prometheus.execute_and_log(command_with_slash, args, called_by_user=True)
                      else:
-                          # It starts with "/" but isn't recognized
                           print(f"Unknown command: {command_with_slash}. Type /help for available commands.")
 
                  # --- Implicit AI Chat (No "/" prefix) ---
                  else:
+                     print("[DEBUG] Input does not start with '/', routing to implicit AI handler...") # DEBUG
                      is_new_chat = not AI_CONVERSATION_HISTORY
-                     await increment_command_count("/ai_implicit") # Count implicit AI calls
-                     # Optional: Log implicit AI initiation
-                     # await prometheus._log_command(datetime.now(), "/ai_implicit", [user_input_full_line], {}, "Implicit AI prompt.", duration_ms=0)
+                     await increment_command_count("/ai_implicit")
                      await handle_ai_prompt(
                          user_new_message=user_input_full_line,
                          is_new_session=is_new_chat,
@@ -588,9 +599,12 @@ async def main_singularity():
                          gemini_model_obj=gemini_model,
                          available_functions=AVAILABLE_PYTHON_FUNCTIONS,
                          session_request_obj={'value': CURRENT_AI_SESSION_ORIGINAL_REQUEST},
-                         step_count_obj={'value': AI_INTERNAL_STEP_COUNT}
+                         step_count_obj={'value': AI_INTERNAL_STEP_COUNT},
+                         prometheus_obj=prometheus,
+                         func_to_command_map=func_to_command_map
                      )
 
+        # ... (rest of the main_singularity function remains the same: exception handling, cleanup) ...
         except KeyboardInterrupt:
             print("\nExiting Market Insights Center Singularity (KeyboardInterrupt). Goodbye!")
             alert_task.cancel()
@@ -600,10 +614,8 @@ async def main_singularity():
         except Exception as e_main_loop:
             print(f"An unexpected error occurred in the main loop: {e_main_loop}")
             traceback.print_exc()
-            # Log the critical error if possible
             if 'prometheus' in locals():
                  try:
-                     # Log minimal info if Prometheus is available
                      await prometheus._log_command(datetime.now(), "/main_loop_error", [], {}, f"Critical Error: {e_main_loop}", success=False, duration_ms=0)
                  except: pass # Avoid errors during error logging
 
@@ -614,17 +626,12 @@ async def main_singularity():
     if prometheus.correlation_task and not prometheus.correlation_task.done():
          prometheus.correlation_task.cancel()
 
-    # Wait for tasks to finish cancellation
-    await asyncio.sleep(0.5) # Give tasks a moment to handle cancellation
+    await asyncio.sleep(0.5)
+    try: await alert_task
+    except asyncio.CancelledError: print("Alert worker successfully shut down.")
     try:
-        await alert_task
-    except asyncio.CancelledError:
-        print("Alert worker successfully shut down.")
-    try:
-         if prometheus.correlation_task:
-              await prometheus.correlation_task
-    except asyncio.CancelledError:
-         print("Prometheus background task successfully shut down.")
+         if prometheus.correlation_task: await prometheus.correlation_task
+    except asyncio.CancelledError: print("Prometheus background task successfully shut down.")
 
     print("Application shutdown complete.")
 
@@ -684,10 +691,12 @@ def check_usage_limit(command: str) -> bool:
     return True # Allow command
 
 
-def display_welcome_message(command_states): # Keep as is
+def display_welcome_message(command_states):
     """Displays the welcome message, conditionally showing animation and ASCII art."""
     print("Initializing Market Insights Center Singularity...")
     show_animation = command_states.get("startup_animation_enabled", True)
+
+    # Full message as defined in the original file
     full_ascii_message = r"""
  _____ ______       ___      ________
 |\   _ \  _   \    |\  \    |\   ____\
@@ -701,36 +710,43 @@ Stage History:
 First Stage: Pilot - 07/05/2025 to 29/05/25
 Second Stage: Eidos - 01/06/25 to 29/07/25
 Third Stage: Cognis - 02/08/25 to 22/09/25
-Fourth Stage: Nexus - 27/09/25 to Present
+Fourth Stage: Nexus - 27/09/25 to 29/10/25
+Fifth Stage: Prometheus - 30/10/25 to Present
 
 Presenting:
- .--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--.
-/ .. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \
-\ \/\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ \/ /
- \/ /`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'\/ /
- / /\                                                                                                        / /\
-/ /\ \  __/\\\\\_____/\\\__/\\\\\\\\\\\\\\\__/\\\_______/\\\__/\\\________/\\\_____/\\\\\\\\\\\___          / /\ \
-\ \/ /   _\/\\\\\\___\/\\\_\/\\\///////////__\///\\\___/\\\/__\/\\\_______\/\\\___/\\\/////////\\\_         \ \/ /
- \/ /     _\/\\\/\\\__\/\\\_\/\\\_______________\///\\\\\\/____\/\\\_______\/\\\__\//\\\______\///__         \/ /
- / /\      _\/\\\//\\\_\/\\\_\/\\\\\\\\\\\_________\//\\\\______\/\\\_______\/\\\___\////\\\_________        / /\
-/ /\ \      _\/\\\\//\\\\/\\\_\/\\\///////___________\/\\\\______\/\\\_______\/\\\______\////\\\______      / /\ \
-\ \/ /       _\/\\\_\//\\\/\\\_\/\\\__________________/\\\\\\_____\/\\\_______\/\\\_________\////\\\___     \ \/ /
- \/ /         _\/\\\__\//\\\\\\_\/\\\________________/\\\////\\\___\//\\\______/\\\___/\\\______\//\\\__     \/ /
- / /\          _\/\\\___\//\\\\\_\/\\\\\\\\\\\\\\\__/\\\/___\///\\\__\///\\\\\\\\\/___\///\\\\\\\\\\\/___    / /\
-/ /\ \          _\///_____\/////__\///////////////__\///_______\///_____\/////////_______\///////////_____  / /\ \
-\ \/ /                                                                                                      \ \/ /
- \/ /                                                                                                        \/ /
- / /\.--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--..--./ /\
-/ /\ \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \.. \/\ \
-\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `'\ `' /
- `--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'`--'
+__| |___________________________________________________________________________________________________________________________________| |__
+__   ___________________________________________________________________________________________________________________________________   __
+  | |                                                                                                                                   | |  
+  | |         _          _           _            _   _         _          _            _       _    _      _                  _        | |  
+  | |        /\ \       /\ \        /\ \         /\_\/\_\ _    /\ \       /\ \         / /\    / /\ /\ \   /\_\               / /\      | |  
+  | |       /  \ \     /  \ \      /  \ \       / / / / //\_\ /  \ \      \_\ \       / / /   / / //  \ \ / / /         _    / /  \     | |  
+  | |      / /\ \ \   / /\ \ \    / /\ \ \     /\ \/ \ \/ / // /\ \ \     /\__ \     / /_/   / / // /\ \ \\ \ \__      /\_\ / / /\ \__  | |  
+  | |     / / /\ \_\ / / /\ \_\  / / /\ \ \   /  \____\__/ // / /\ \_\   / /_ \ \   / /\ \__/ / // / /\ \_\\ \___\    / / // / /\ \___\ | |  
+  | |    / / /_/ / // / /_/ / / / / /  \ \_\ / /\/________// /_/_ \/_/  / / /\ \ \ / /\ \___\/ // /_/_ \/_/ \__  /   / / / \ \ \ \/___/ | |  
+  | |   / / /__\/ // / /__\/ / / / /   / / // / /\/_// / // /____/\    / / /  \/_// / /\/___/ // /____/\    / / /   / / /   \ \ \       | |  
+  | |  / / /_____// / /_____/ / / /   / / // / /    / / // /\____\/   / / /      / / /   / / // /\____\/   / / /   / / /_    \ \ \      | |  
+  | | / / /      / / /\ \ \  / / /___/ / // / /    / / // / /______  / / /      / / /   / / // / /______  / / /___/ / //_/\__/ / /      | |  
+  | |/ / /      / / /  \ \ \/ / /____\/ / \/_/    / / // / /_______\/_/ /      / / /   / / // / /_______\/ / /____\/ / \ \/___/ /       | |  
+  | |\/_/       \/_/    \_\/\/_________/          \/_/ \/__________/\_\/       \/_/    \/_/ \/__________/\/_________/   \_____\/        | |  
+  | |                                                                                                                                   | |  
+__| |___________________________________________________________________________________________________________________________________| |__
+__   ___________________________________________________________________________________________________________________________________   __
+  | |                                                                                                                                   | |  
 """
+
+    # Find the split point
+    split_marker = "Presenting:"
+    split_index = full_ascii_message.find(split_marker)
+
+    static_ascii_part = full_ascii_message[:split_index]
+    animated_ascii_part = full_ascii_message[split_index:]
+
     if show_animation:
         animation_chars = ["|", "/", "-", "\\"]
         for _ in range(10): # Shortened animation
             for char in animation_chars:
                 print(f"\rLoading... {char}", end="", flush=True)
-                py_time.sleep(0.05) # Faster sleep
+                py_time.sleep(0.1) # Faster sleep
         print("\rLoading... Done!          ")
         print("\n" + "="*45)
         target_message = "Singularity, Awake! Open... Your... Eyes..."
@@ -744,21 +760,26 @@ Presenting:
             for _ in range(2): # Fewer random chars
                 random_char = random.choice(char_set)
                 print(f"\r{revealed_message}{random_char}", end="", flush=True)
-                py_time.sleep(0.01) # Faster sleep
+                py_time.sleep(0.05) # Faster sleep
             revealed_message += char
             print(f"\r{revealed_message}", end="", flush=True)
-            py_time.sleep(0.05) # Faster sleep
+            py_time.sleep(0.1) # Faster sleep
         print()
         print("="*45)
-        # Simplified ASCII art display for animation mode
-        start_index = full_ascii_message.find(" .--..--..--")
-        static_ascii_part = full_ascii_message[:start_index]
-        animated_ascii_block = full_ascii_message[start_index:]
+
+        # --- MODIFIED ANIMATION LOGIC ---
         print("\nLaunching Singularity:")
+        # 1. Print the static part (Singularity logo + History) instantly
         print(static_ascii_part, end="", flush=True)
-        # Quick display for animation mode instead of char-by-char
-        print(animated_ascii_block)
-        print("\n\n")
+
+        # 2. Print the animated part (Prometheus) with a fast typing effect
+        for char in animated_ascii_part:
+            print(char, end="", flush=True)
+            # Adjust sleep time for desired speed. 0.001 is very fast.
+            py_time.sleep(0.001) 
+
+        print("\n\n") # Add newlines at the end
+        # --- END OF MODIFIED LOGIC ---
 
     else: # No animation
         print("Loading... Done!")
@@ -766,6 +787,7 @@ Presenting:
         print("Singularity, Awake! Open... Your... Eyes...")
         print("="*45)
         print("\nLaunching Singularity:")
+        # Print the *entire* message at once
         print(full_ascii_message)
         print("\n\n")
 
