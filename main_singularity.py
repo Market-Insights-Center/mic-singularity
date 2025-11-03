@@ -68,6 +68,7 @@ import io
 
 # --- Prometheus Core Import ---
 from prometheus_core import Prometheus # Import the new class
+from kronos_command import handle_kronos_command, kronos_scheduler_worker # <<< ADD THIS LINE
 
 # --- Command Module Imports ---
 # Import all command handlers
@@ -415,6 +416,7 @@ TOOLBOX_MAP: Dict[str, Callable] = {
     "memo": handle_memo_command,
     "strategy_recipe": handle_strategy_recipe_command,
     "propose_improvement": handle_propose_improvement_command, # <<< Added improvement proposal handler
+    "kronos": handle_kronos_command # <<< ADD THIS LINE
 }
 
 # --- Core Application Logic ---
@@ -459,6 +461,7 @@ async def main_singularity():
     display_welcome_message(command_states)
     display_utility_commands_only()
     alert_task = asyncio.create_task(alert_worker())
+    kronos_task = asyncio.create_task(kronos_scheduler_worker(prometheus))
 
     func_to_command_map = {func.__name__: f"/{cmd_name}" for cmd_name, func in TOOLBOX_MAP.items()} # Use full command path
     for py_func_name, py_func_obj in AVAILABLE_PYTHON_FUNCTIONS.items():
@@ -548,6 +551,13 @@ async def main_singularity():
                      func_to_command_map=func_to_command_map
                  )
                  continue
+            
+            elif command_with_slash == "/kronos":
+                print("[DEBUG] Routing to /kronos handler...")
+                await increment_command_count(command_with_slash) # Log the command usage
+                # Call the handler directly, passing the live Prometheus instance
+                await handle_kronos_command(args, prometheus_instance=prometheus)
+                continue # Skip the default Prometheus routing
 
             # --- Command Routing Through Prometheus ---
             else:
@@ -623,12 +633,17 @@ async def main_singularity():
     print("Shutting down background tasks...")
     if not alert_task.done():
         alert_task.cancel()
+    if 'kronos_task' in locals() and not kronos_task.done(): # <<< ADD THIS
+        kronos_task.cancel()                               # <<< ADD THIS
     if prometheus.correlation_task and not prometheus.correlation_task.done():
          prometheus.correlation_task.cancel()
 
     await asyncio.sleep(0.5)
     try: await alert_task
     except asyncio.CancelledError: print("Alert worker successfully shut down.")
+    try:                                                        # <<< ADD THIS
+        if 'kronos_task' in locals(): await kronos_task         # <<< ADD THIS
+    except asyncio.CancelledError: print("Kronos scheduler successfully shut down.") # <<< ADD THIS
     try:
          if prometheus.correlation_task: await prometheus.correlation_task
     except asyncio.CancelledError: print("Prometheus background task successfully shut down.")

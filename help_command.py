@@ -17,7 +17,7 @@ MASTER_COMMAND_LIST = [
     "custom", "quickscore", "breakout", "market", "cultivate", 
     "assess A", "assess B", "assess C", "assess D", "assess E",
     "simulation", "backtest", "macdforecast", "mlforecast", "ai", "voice", "dev",
-    "tracking", "fairvalue", "derivative"
+    "tracking", "fairvalue", "derivative", "prometheus", "kronos"
 ]
 
 def load_command_states():
@@ -617,7 +617,7 @@ def display_commands():
         command_lines.append("  CLI Usage:")
         command_lines.append("    /mlforecast AAPL                (Runs the ML forecast for Apple Inc.)")
 
-    if any(is_enabled(c) for c in ["ai", "voice", "dev"]):
+    if any(is_enabled(c) for c in ["ai", "voice", "dev", "prometheus", "kronos"]):
         command_lines.append("\nAI & Voice Commands")
         command_lines.append("-------------------")
     if is_enabled("ai"):
@@ -645,6 +645,17 @@ def display_commands():
         command_lines.append("    /dev modify <file.py> \"<change request>\"")
         command_lines.append("    /dev backtest <file.py> on <TICKER> over <period>")
         command_lines.append("    /dev backtest <file.py> on SCREENER over <period>")
+    if is_enabled("prometheus"):
+        command_lines.append("\n/prometheus - Open the Prometheus Meta-AI shell.")
+        command_lines.append("  Description: Access the AI's internal analysis shell. Used to manually trigger")
+        command_lines.append("               workflow analysis, generate strategy recipes, or propose code improvements.")
+        command_lines.append("  CLI Usage: /prometheus   (Enters the interactive Prometheus shell)")
+    if is_enabled("kronos"):
+        command_lines.append("\n/kronos - Open the Kronos Meta-Control shell.")
+        command_lines.append("  Description: Access the supervisor shell to manage Prometheus's autonomous features,")
+        command_lines.append("               schedule tasks, and run automated optimization and testing loops.")
+        command_lines.append("  CLI Usage: /kronos   (Enters the interactive Kronos shell)")
+    # --- END OF NEW SECTION ---
 
     command_lines.append("\nUtility Commands")
     command_lines.append("-------------------")
