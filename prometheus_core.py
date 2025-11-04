@@ -28,6 +28,7 @@ IMPROVED_CODE_DIR = 'improved_commands' # Directory for generated code
 COMMANDS_DIR = 'Isolated Commands' # Directory for original commands
 OPTIMIZABLE_PARAMS_FILE = 'optimizable_parameters.json' # <-- NEW CONFIG FILE
 PROMETHEUS_STATE_FILE = 'prometheus_state.json'
+DEFAULT_CORR_INTERVAL_HOURS = 6
 
 # --- Prometheus Core Logger ---
 prometheus_logger = logging.getLogger('PROMETHEUS_CORE')
@@ -877,7 +878,7 @@ class Prometheus:
             prometheus_logger.exception(f"Error saving definition for {command_name_with_slash}: {e}"); print(f"   -> Prometheus Synthesis: [ERROR] saving workflow: {e}")
 
     async def background_correlation_analysis(self):
-        # ... (implementation remains the same - excluding powerscore) ...
+        # ... (implementation remains the same) ...
         try: from main_singularity import get_sp500_symbols_singularity
         except ImportError: prometheus_logger.error("Failed import get_sp500_symbols_singularity."); return
         commands_to_correlate = {
@@ -891,8 +892,22 @@ class Prometheus:
         if not valid_commands_to_run: prometheus_logger.error("BG Corr: No valid functions."); print("[Prometheus Background] ERROR: No valid functions."); return
         prometheus_logger.info(f"BG Corr: Will analyze: {list(valid_commands_to_run.keys())}")
         while True:
-             wait_hours = 6; prometheus_logger.info(f"BG Corr: Waiting {wait_hours} hours."); print(f"\n[Prometheus Background] Next correlation check in ~{wait_hours} hours...")
-             await asyncio.sleep(3600 * wait_hours); cycle_start_time = datetime.now(); prometheus_logger.info("Starting BG correlation cycle."); print(f"\n[Prometheus Background] Starting cycle @ {cycle_start_time.strftime('%H:%M:%S')}...")
+             # <<< START OF FIX >>>
+             # Load the wait interval from the state file *inside* the loop.
+             wait_hours = DEFAULT_CORR_INTERVAL_HOURS # Default
+             try:
+                 if os.path.exists(PROMETHEUS_STATE_FILE):
+                     with open(PROMETHEUS_STATE_FILE, 'r') as f:
+                         state = json.load(f)
+                         # Read the configured interval, fall back to default if not found or invalid
+                         wait_hours = float(state.get("correlation_interval_hours", DEFAULT_CORR_INTERVAL_HOURS))
+             except (IOError, json.JSONDecodeError, ValueError) as e:
+                 prometheus_logger.warning(f"BG Corr: Could not read interval from state file, using default. Error: {e}")
+                 wait_hours = DEFAULT_CORR_INTERVAL_HOURS
+             # <<< END OF FIX >>>
+             
+             prometheus_logger.info(f"BG Corr: Waiting {wait_hours} hours."); print(f"\n[Prometheus Background] Next correlation check in ~{wait_hours} hours...")
+             await asyncio.sleep(int(3600 * wait_hours)); cycle_start_time = datetime.now(); prometheus_logger.info("Starting BG correlation cycle."); print(f"\n[Prometheus Background] Starting cycle @ {cycle_start_time.strftime('%H:%M:%S')}...")
              try:
                  sp500_tickers = await asyncio.to_thread(get_sp500_symbols_singularity);
                  if not sp500_tickers: prometheus_logger.warning("BG Corr: Failed S&P500 fetch."); continue
