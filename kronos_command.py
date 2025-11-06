@@ -15,12 +15,24 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
 from prometheus_core import Prometheus # Import Prometheus class
 from dateutil.relativedelta import relativedelta
+import logging
 # (No risk_command import needed)
+
+# --- (Inside kronos_command.py) ---
+
+# --- Add these new imports ---
+import aiosqlite
+import shlex
+from dateutil.relativedelta import relativedelta
+# --- (End of new imports) ---
 
 # --- Constants ---
 PROMETHEUS_STATE_FILE = 'prometheus_state.json'
 KRONOS_SCHEDULE_FILE = 'kronos_schedule.json'
 SANDBOX_DIR = 'kronos_sandbox' # Directory for test outputs
+OPTIMIZABLE_PARAMS_FILE = 'optimizable_parameters.json'
+
+prometheus_logger = logging.getLogger('PROMETHEUS_CORE') # <-- ADD THIS LINE
 
 # Define cache file paths directly to avoid import issues
 SP500_CACHE_FILE = 'sp500_risk_cache.csv'
@@ -31,6 +43,589 @@ DEFAULT_CORR_INTERVAL_HOURS = 6
 DEFAULT_WORKFLOW_CHANCE = 0.1
 
 # --- Kronos Helper Functions ---
+
+# --- (Inside "Kronos Helper Functions" section) ---
+
+# --- NEW: Test Dimension Definitions ---
+MARKET_CONDITIONS = {
+    "COVID_Crash": {"start_date": "2020-01-15", "end_date": "2020-04-15"},
+    "2021_Bull":   {"start_date": "2021-01-01", "end_date": "2022-01-01"},
+    "2022_Bear":   {"start_date": "2022-01-01", "end_date": "2023-01-01"},
+    "Current_1Y":  {"start_date": (datetime.now() - relativedelta(years=1)).strftime('%Y-%m-%d'), 
+                    "end_date": datetime.now().strftime('%Y-%m-%d')}
+    # Add more conditions as needed
+}
+
+async def _get_universe(name: str, prometheus_instance: Prometheus) -> Dict[str, Any]:
+    """
+    Fetches a list of tickers for a universe and identifies its representative ticker.
+    NEW: Supports AI-fabricated screeners.
+    Returns: {"tickers": ["A", "AAPL", ...], "representative_ticker": "SPY"}
+    """
+    print(f"   [Convergence] Loading universe: {name}...")
+    name_upper = name.upper()
+    
+    try:
+        if name_upper == "SPY_500":
+            # In a real implementation, this would call get_sp500_symbols_singularity
+            return {"tickers": ["SPY", "AAPL", "MSFT", "GOOG"], "representative_ticker": "SPY"}
+        
+        elif name_upper == "QQQ_100":
+            # This would call get_specific_index_tickers
+            return {"tickers": ["QQQ", "AAPL", "MSFT", "NVDA"], "representative_ticker": "QQQ"}
+        
+        # --- START OF PHASE 3: AI SCREENERS ---
+        elif name_upper.startswith("AI_"):
+            print(f"   [Convergence] Running AI-fabricated screener: {name}...")
+            screener_tickers = []
+            rep_ticker = "SPY" # Default representative
+            
+            # --- START OF FIX: Build ai_params dict ---
+            ai_params_for_screener = {}
+            ai_query = "" # This is just for the screener's internal logging
+            
+            if name_upper == "AI_TECH_GROWTH":
+                ai_query = "Find me top tech stocks with high growth"
+                rep_ticker = "QQQ"
+                # This structure matches the 'handle_dev_backtest' call in dev_command.py
+                ai_params_for_screener = {
+                    "sector_identifiers": ["Technology"],
+                    "criteria": [
+                        {"metric": "growth_score", "operator": ">", "value": 70},
+                        {"metric": "technical_score", "operator": ">", "value": 60}
+                    ],
+                    "top_n": 20
+                }
+            
+            elif name_upper == "AI_VALUE_STOCKS":
+                ai_query = "Find me undervalued stocks in any sector"
+                rep_ticker = "SPYV" # S&P 500 Value ETF
+                ai_params_for_screener = {
+                    "sector_identifiers": ["Market"], # 'Market' or 'Any'
+                    "criteria": [
+                        {"metric": "fundamental_score", "operator": ">", "value": 80},
+                        {"metric": "technical_score", "operator": ">", "value": 50}
+                    ],
+                    "top_n": 20
+                }
+                
+            elif name_upper == "AI_STRONG_MOMENTUM":
+                ai_query = "Find me stocks with strong technical momentum"
+                rep_ticker = "MTUM" # Momentum Factor ETF
+                ai_params_for_screener = {
+                    "sector_identifiers": ["Market"],
+                    "criteria": [
+                        {"metric": "fundamental_score", "operator": ">", "value": 50},
+                        {"metric": "technical_score", "operator": ">", "value": 80}
+                    ],
+                    "top_n": 20
+                }
+
+            else:
+                print(f"   [Convergence] Unknown AI Screener recipe: {name}. Defaulting to SPY.")
+                return {"tickers": ["SPY"], "representative_ticker": "SPY"}
+
+            # Call screener_func (find_and_screen_stocks) with the correct arguments
+            # as seen in dev_command.py: handle_dev_backtest -> screener_func(args=[], ai_params=...)
+            results = await prometheus_instance.screener_func(
+                args=[ai_query], # Pass query as args[0]
+                ai_params=ai_params_for_screener,
+                is_called_by_ai=True
+            )
+            # --- END OF FIX ---
+
+            if results and results.get("status") == "success":
+                # The screener func returns a dict with a 'results' key
+                screener_tickers = [item['Ticker'] for item in results.get('results', [])]
+            else:
+                print(f"   [Convergence] AI Screener failed: {results.get('message', 'Unknown error')}")
+
+            if not screener_tickers:
+                print(f"   [Convergence] AI Screener '{name}' returned no tickers. Defaulting to rep_ticker.")
+                return {"tickers": [rep_ticker], "representative_ticker": rep_ticker}
+
+            print(f"   [Convergence] AI Screener found {len(screener_tickers)} tickers. Using {rep_ticker} as proxy.")
+            return {"tickers": screener_tickers, "representative_ticker": rep_ticker}
+        # --- END OF PHASE 3 ---
+
+        else:
+            print(f"   [Convergence] Unknown universe: {name}. Using as single ticker.")
+            return {"tickers": [name_upper], "representative_ticker": name_upper}
+            
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR in _get_universe '{name}': {e}")
+        traceback.print_exc()
+        return {"tickers": [], "representative_ticker": None}
+         
+def _format_trade_frequency(trades_per_day: float) -> str:
+    """
+    Converts a trades_per_day float into a human-readable string
+    with a unit that keeps the number reasonable.
+    """
+    if trades_per_day == 0:
+        return "0.00 trades/yr"
+
+    # Trades per Year (approx 252 trading days)
+    trades_per_year = trades_per_day * 252
+    if trades_per_year < 10.0:
+        return f"{trades_per_year:.2f} trades/yr"
+        
+    # Trades per Month (approx 21 trading days)
+    trades_per_month = trades_per_day * 21
+    if trades_per_month < 10.0:
+        return f"{trades_per_month:.2f} trades/mo"
+
+    # Trades per Week
+    trades_per_week = trades_per_day * 5
+    if trades_per_week < 10.0:
+        return f"{trades_per_week:.2f} trades/wk"
+
+    # Trades per Day
+    if trades_per_day < 10.0:
+        return f"{trades_per_day:.2f} trades/day"
+        
+    # Trades per Hour (assuming 7 trading hours)
+    trades_per_hour = trades_per_day / 7
+    return f"{trades_per_hour:.2f} trades/hr"
+
+# --- (Inside "--- NEW: Database Helpers for Convergence ---" section) --
+# --- NEW: Database Helpers for Convergence ---
+async def _log_convergence_run(db_path: str, run_name: str, parent_run_id: Optional[int], run_params_json: str) -> int:
+    """Creates a new entry in convergence_runs and returns the new run_id."""
+    start_time = datetime.utcnow().isoformat()
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO convergence_runs (run_name, start_time, status, run_parameters_json, parent_run_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (run_name, start_time, "Running", run_params_json, parent_run_id)
+            )
+            await db.commit()
+            return cursor.lastrowid
+    except Exception as e:
+        print(f"❌ CRITICAL: Failed to log convergence run to DB: {e}")
+        return -1
+
+async def _update_convergence_run_status(db_path: str, run_id: int, status: str):
+    """Updates the status and end_time of a convergence run."""
+    end_time = datetime.utcnow().isoformat()
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                "UPDATE convergence_runs SET status = ?, end_time = ? WHERE run_id = ?",
+                (status, end_time, run_id)
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"❌ CRITICAL: Failed to update convergence run status in DB: {e}")
+
+async def _log_convergence_result(db_path: str, run_id: int, universe: str, condition: str, strategy: str, result: Dict[str, Any], test_duration_days: int):
+    """Logs a single permutation's result to the convergence_results table."""
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            # --- START OF MODIFICATION ---
+            await db.execute(
+                """
+                INSERT INTO convergence_results (
+                    run_id, universe, market_condition, strategy_name, 
+                    best_params_json, best_sharpe_ratio, total_return_pct, 
+                    max_drawdown_pct, trade_count, test_duration_days,
+                    buy_hold_return_pct
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id, universe, condition, strategy,
+                    result.get("best_params_json"),
+                    result.get("best_sharpe_ratio"),
+                    result.get("total_return_pct"),
+                    result.get("max_drawdown_pct"),
+                    result.get("trade_count"),
+                    test_duration_days,
+                    result.get("buy_hold_return_pct") # Add this
+                )
+            )
+            # --- END OF MODIFICATION ---
+            await db.commit()
+    except Exception as e:
+        print(f"❌ CRITICAL: Failed to log convergence result to DB: {e}")
+
+async def _get_seed_population(db_path: str, universe: str, condition: str, strategy: str, num_to_seed: int = 10) -> List[Dict[str, Any]]:
+    """
+    (Evolutionary Memory Feature)
+    Fetches the Top N best-performing parameter sets from ALL previous runs
+    for this exact scenario to seed the new generation.
+    """
+    prometheus_logger.debug(f"   [Convergence] Searching all history for Top {num_to_seed} seeds for {strategy} in {condition}...")
+    seeds = []
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT best_params_json, total_return_pct FROM convergence_results
+                WHERE universe = ? 
+                  AND market_condition = ? 
+                  AND strategy_name = ?
+                  AND total_return_pct > -999.0
+                  AND best_params_json IS NOT NULL
+                ORDER BY total_return_pct DESC
+                LIMIT ?
+                """,
+                (universe, condition, strategy, num_to_seed)
+            )
+            rows = await cursor.fetchall()
+            
+            if rows:
+                prometheus_logger.info(f"   [Convergence] Found {len(rows)} high-performing seeds from past runs.")
+                for row in rows:
+                    try:
+                        seeds.append(json.loads(row[0]))
+                    except Exception:
+                        continue # Skip bad JSON
+                return seeds
+            
+    except Exception as e:
+        print(f"   [Convergence] Error fetching seed population: {e}")
+    
+    prometheus_logger.info("   [Convergence] No historical seeds found. Using random population.")
+    return []
+
+# --- NEW: Orchestrator Functions ---
+async def _run_convergence_matrix(
+    run_id: int,
+    db_path: str,
+    run_name: str,
+    universes: List[str],
+    conditions: List[str],
+    strategies: List[str],
+    prometheus_instance: Prometheus
+):
+    """The main orchestration loop for the convergence command."""
+    prometheus_logger.info(f"--- [Convergence Run {run_id}: '{run_name}'] Starting ---")
+    print(f"--- [Convergence Run {run_id}: '{run_name}'] Starting ---")
+    print(f"   Universes: {universes}")
+    print(f"   Conditions: {conditions}")
+    print(f"   Strategies: {strategies}")
+    
+    total_permutations = len(universes) * len(conditions) * len(strategies)
+    completed_count = 0
+    
+    for uni_name in universes:
+        prometheus_logger.debug(f"[Convergence {run_id}] Getting universe '{uni_name}'")
+        universe_data = await _get_universe(uni_name, prometheus_instance)
+        rep_ticker = universe_data.get("representative_ticker")
+        if not rep_ticker:
+            print(f"   SKIPPING Universe: {uni_name} (no representative ticker found).")
+            prometheus_logger.warning(f"[Convergence {run_id}] Skipping Universe {uni_name}, no rep_ticker.")
+            continue
+            
+        for cond_name in conditions:
+            condition_dates = MARKET_CONDITIONS.get(cond_name)
+            if not condition_dates:
+                print(f"   SKIPPING Condition: {cond_name} (not defined in MARKET_CONDITIONS).")
+                prometheus_logger.warning(f"[Convergence {run_id}] Skipping Condition {cond_name}, not defined.")
+                continue
+                
+            try:
+                start_dt = datetime.strptime(condition_dates['start_date'], '%Y-%m-%d')
+                end_dt = datetime.strptime(condition_dates['end_date'], '%Y-%m-%d')
+                test_duration_days = (end_dt - start_dt).days
+                if test_duration_days <= 0: test_duration_days = 1
+            except Exception:
+                test_duration_days = 365 
+                
+            for strat_name in strategies:
+                completed_count += 1
+                print(f"\n[Convergence Run {run_id} | {completed_count}/{total_permutations}]")
+                print(f"   Testing: {strat_name} on {rep_ticker} ({uni_name})")
+                print(f"   Condition: {cond_name} ({test_duration_days} days)")
+                prometheus_logger.info(f"[Convergence {run_id}] Running {strat_name} on {rep_ticker} ({cond_name})")
+
+                seed_pop = await _get_seed_population(db_path, uni_name, cond_name, strat_name, num_to_seed=10)
+                
+                try:
+                    best_params, best_return_pct, all_metrics = await prometheus_instance.run_parameter_optimization(
+                        command_name="/backtest",
+                        strategy_name=strat_name,
+                        ticker=rep_ticker,
+                        period=None, 
+                        start_date=condition_dates["start_date"],
+                        end_date=condition_dates["end_date"],
+                        seed_population=seed_pop,
+                        generations=15, 
+                        population_size=30 
+                    )
+                    
+                    if best_params and best_return_pct > -float('inf'):
+                        prometheus_logger.info(f"[Convergence {run_id}] GA Success for {strat_name}. Best Return: {best_return_pct:.2f}%")
+                        
+                        all_metrics["best_params_json"] = json.dumps(best_params, sort_keys=True)
+                        
+                        print(f"   -> SUCCESS: Best Return {best_return_pct:.2f}%")
+                        
+                        # --- START OF FIX ---
+                        bh_return = all_metrics.get("buy_hold_return_pct")
+                        prometheus_logger.debug(f"GA run returned metrics: {all_metrics}")
+                        if isinstance(bh_return, (int, float)):
+                            print(f"   -> vs. Buy & Hold Return: {bh_return:.2f}%")
+                        else:
+                            print(f"   -> vs. Buy & Hold Return: N/A (Value was: {bh_return})")
+                        # --- END OF FIX ---
+                        
+                        result_to_log = all_metrics
+                    else:
+                        print(f"   -> FAILED: Optimization did not find a valid result.")
+                        prometheus_logger.warning(f"[Convergence {run_id}] GA FAILED for {strat_name}. No valid result.")
+                        result_to_log = {"total_return_pct": -float('inf')}
+
+                    await _log_convergence_result(db_path, run_id, uni_name, cond_name, strat_name, result_to_log, test_duration_days)
+
+                except Exception as e:
+                    print(f"   -> ❌ CRITICAL ERROR during optimization: {e}")
+                    prometheus_logger.error(f"[Convergence {run_id}] CRITICAL GA Error for {strat_name}: {e}", exc_info=True)
+                    traceback.print_exc()
+                    await _log_convergence_result(db_path, run_id, uni_name, cond_name, strat_name, {"total_return_pct": -float('inf'), "error": str(e)}, test_duration_days)
+
+    print(f"\n--- [Convergence Run {run_id}] Finished All Permutations ---")
+    prometheus_logger.info(f"--- [Convergence Run {run_id}] Finished All Permutations ---")
+    await _update_convergence_run_status(db_path, run_id, "Completed")
+    
+    await _generate_convergence_summary(run_id, prometheus_instance)
+
+async def _generate_convergence_summary(run_id: int, prometheus_instance: Prometheus):
+    """
+    (Phase 4)
+    Queries all results for the run, analyzes them with Pandas,
+    and calls the AI to generate a full, human-readable report.
+    """
+    print("\n--- Generating Convergence Summary ---")
+    
+    db_path = prometheus_instance.db_path
+    
+    try:
+        query = """
+            SELECT 
+                strategy_name, market_condition, universe,
+                total_return_pct, trade_count, test_duration_days, 
+                best_sharpe_ratio, best_params_json,
+                buy_hold_return_pct
+            FROM convergence_results
+            WHERE run_id = ? AND total_return_pct > -999.0
+        """
+        
+        rows_data = []
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = sqlite3.Row
+            cursor = await db.execute(query, (run_id,))
+            rows_data = await cursor.fetchall()
+
+        if not rows_data:
+            print("No successful results were logged for this convergence run.")
+            return
+
+        df = pd.DataFrame([dict(row) for row in rows_data])
+
+    except Exception as e:
+        print(f"❌ Error querying convergence summary data: {e}")
+        traceback.print_exc()
+        return
+
+    if df.empty:
+        print("No successful results were logged for this convergence run.")
+        return
+
+    print("   -> Analyzing results...")
+    
+    # --- START OF FIX: Handle N/A (None/NaN) values correctly ---
+    df['trades'] = df['trade_count'].fillna(0)
+    df['duration'] = df['test_duration_days'].fillna(365)
+    df['return_pct'] = df['total_return_pct'].fillna(0.0)
+    
+    # Use np.nan for numeric types that are missing
+    df['sharpe'] = df['best_sharpe_ratio'].replace([None], np.nan)
+    df['buy_hold_pct'] = df['buy_hold_return_pct'].replace([None], np.nan)
+    # --- END OF FIX ---
+    
+    df['trades_per_day'] = df['trades'] / df['duration']
+    df['return_per_day_pct'] = df['return_pct'] / df['duration']
+    df['profit_time_ratio'] = (df['return_pct'] / (df['trades'] + 1))
+    
+    df['trade_freq_str'] = df['trades_per_day'].apply(_format_trade_frequency)
+    df['alpha_pct'] = df['return_pct'] - df['buy_hold_pct'] # This will correctly result in NaN
+    
+    best_overall = df.loc[df['return_pct'].idxmax()]
+    
+    # Handle case where all alpha is NaN
+    if not df['alpha_pct'].isnull().all():
+        best_alpha = df.loc[df['alpha_pct'].idxmax()]
+        most_robust_strategy = df.groupby('strategy_name')['alpha_pct'].mean().idxmax()
+    else:
+        best_alpha = best_overall # Fallback
+        most_robust_strategy = df.groupby('strategy_name')['return_pct'].mean().idxmax()
+
+    
+    # --- START OF FIX: Handle NaN in the analysis string ---
+    def format_bh_comparison(row):
+        if pd.isna(row['buy_hold_pct']):
+            return "(vs. Buy&Hold: N/A)"
+        return f"(vs. Buy&Hold's {row['buy_hold_pct']:.2f}%)"
+    
+    def format_alpha(row):
+         if pd.isna(row['alpha_pct']):
+            return "N/A"
+         return f"{row['alpha_pct']:.2f}%"
+
+    analysis_summary = f"""
+    **Overall Analysis:**
+    - **Most Profitable Run (Raw %):** A '{best_overall['strategy_name']}' strategy returned **{best_overall['return_pct']:.2f}%** {format_bh_comparison(best_overall)} in the '{best_overall['market_condition']}' condition.
+    - **Best Outperformance (Alpha):** A '{best_alpha['strategy_name']}' strategy in '{best_alpha['market_condition']}' outperformed Buy&Hold by **{format_alpha(best_alpha)}**.
+    - **Most Robust Strategy:** On average, '{most_robust_strategy}' was the best strategy found.
+    """
+    # --- END OF FIX ---
+    
+    top_5_df = df.sort_values('return_pct', ascending=False).head(5)
+    
+    columns_to_show = ['strategy_name', 'market_condition', 'return_pct', 'buy_hold_pct', 'alpha_pct', 'trade_freq_str', 'sharpe', 'best_params_json']
+    columns_to_show = [col for col in columns_to_show if col in top_5_df.columns]
+    
+    # Use floatfmt to handle NaN -> "N/A"
+    top_5_results_str = top_5_df[columns_to_show].to_markdown(
+        index=False,
+        floatfmt=(".s", ".s", ".2f", ".2f", ".2f", ".s", ".3f", ".s"),
+        missingval="N/A"
+    )
+    
+    print("   -> Calling AI for final synthesis...")
+    prompt = f"""
+    You are an expert quantitative analyst. I have just completed a 'Convergence' run, a meta-optimization test of trading strategies.
+    
+    Your job is to analyze the results and provide a detailed summary. Pay close attention to the strategy's return ('return_pct') versus the benchmark 'buy_hold_pct'. The 'alpha_pct' column shows this difference.
+    
+    If 'buy_hold_pct', 'alpha_pct', or 'sharpe' are 'N/A', it means the data was not available for that run. You MUST state this limitation. Do not treat 'N/A' and '0.00%' as the same thing.
+    
+    Here is the high-level analysis of the run:
+    {analysis_summary}
+    
+    Here are the Top 5 most profitable permutations found (sorted by raw 'return_pct'):
+    {top_5_results_str}
+    
+    Based *only* on this data, please provide the following:
+    1.  **Executive Summary:** A brief summary of the most important findings. Did the strategies successfully beat Buy & Hold? (Acknowledge if B&H data was 'N/A').
+    2.  **Best Overall Strategy:** Identify the single best run. Was it the 'Most Profitable' or the one with the 'Best Outperformance (Alpha)'? Detail its strategy, parameters, and performance (Return %, vs. Buy&Hold %, Alpha %, and trade frequency).
+    3.  **Market Condition Insights:** How did market conditions affect performance and the ability to beat the market?
+    4.  **Recommendations for Investors:**
+        * **For an Aggressive (Max Profit) Investor:** Which strategy/parameter set from this test would you recommend?
+        * **For a Conservative (Risk-Averse) Investor:** Which strategy had the best *outperformance* ('alpha_pct') while also having a good Sharpe Ratio? (Acknowledge if Sharpe is 'N/A').
+    
+    Be clear, concise, and base all conclusions strictly on the data provided.
+    """
+    
+    try:
+        model_to_use = prometheus_instance.gemini_model
+        response = await model_to_use.generate_content_async(prompt)
+        ai_response = response.text
+        
+        if not ai_response:
+            raise Exception("AI returned an empty response.")
+            
+        print("\n--- 🤖 Convergence AI Summary Report 🤖 ---")
+        print(ai_response)
+        print("------------------------------------------")
+        
+    except Exception as e:
+        print(f"❌ AI Summary Generation Failed: {e}")
+        print("--- Top 5 Results (Manual Fallback) ---")
+        print(top_5_df[columns_to_show].to_markdown(index=False, missingval="N/A"))
+                        
+async def _handle_kronos_convergence(parts: List[str], prometheus_instance: Prometheus):
+    """Handles the 'convergence' command in the Kronos shell."""
+    if len(parts) < 2:
+        # --- MODIFICATION: Updated help text to remove --parent_run ---
+        print("Usage: convergence <run_name> --universes=... --conditions=... --strategies=... [--time_limit=1h]")
+        print("  --universes: Comma-separated list (e.g., SPY_500,QQQ)")
+        print("  --conditions: Comma-separated list (e.g., 2022_Bear,Current_1Y)")
+        print("  --strategies: Comma-separated list from optimizable_parameters.json (e.g., rsi,ma_crossover)")
+        print("  --time_limit: Optional (e.g., 30m, 2h, 1d)")
+        print("  (Evolutionary memory is now automatic and always on)")
+        return
+
+    run_name = parts[1]
+    args = parts[2:]
+    
+    parsed_args = {
+        "universes": None, "conditions": None, "strategies": None,
+        "time_limit": None, "parent_run": None # Keep parent_run for parsing, but don't use it
+    }
+    for arg in args:
+        if arg.startswith("--universes="):
+            parsed_args["universes"] = arg.split('=', 1)[1].split(',')
+        elif arg.startswith("--conditions="):
+            parsed_args["conditions"] = arg.split('=', 1)[1].split(',')
+        elif arg.startswith("--strategies="):
+            parsed_args["strategies"] = arg.split('=', 1)[1].split(',')
+        elif arg.startswith("--time_limit="):
+            parsed_args["time_limit"] = arg.split('=', 1)[1]
+        elif arg.startswith("--parent_run="):
+            # We no longer use this, but we'll parse it to avoid an error
+            print("   -> Note: --parent_run is deprecated. Evolutionary memory is now automatic.")
+            pass
+            
+    if not all([parsed_args["universes"], parsed_args["conditions"], parsed_args["strategies"]]):
+        print("❌ Error: --universes, --conditions, and --strategies are all required.")
+        return
+
+    valid_strategies = prometheus_instance.optimizable_params_config.get("/backtest", {}).keys()
+    for s in parsed_args["strategies"]:
+        if s not in valid_strategies:
+            print(f"❌ Error: Strategy '{s}' is not defined as optimizable in {OPTIMIZABLE_PARAMS_FILE}.")
+            return
+            
+    timeout_seconds = None
+    if parsed_args["time_limit"]:
+        delta = _parse_interval_to_timedelta(parsed_args["time_limit"])
+        if delta:
+            timeout_seconds = delta.total_seconds()
+            print(f"   -> Time Limit set to {timeout_seconds} seconds ({parsed_args['time_limit']}).")
+        else:
+            print(f"⚠️ Warning: Invalid time_limit format '{parsed_args['time_limit']}'. Running with no time limit.")
+    
+    # We still log parent_run=None for schema compatibility, but it's not used
+    run_params_json = json.dumps(parsed_args, default=str)
+    run_id = await _log_convergence_run(
+        prometheus_instance.db_path,
+        run_name,
+        None, # Pass None for parent_run_id
+        run_params_json
+    )
+    if run_id == -1:
+        print("❌ Failed to start convergence run (database error).")
+        return
+
+    # Create the main task
+    task = _run_convergence_matrix(
+        run_id=run_id,
+        db_path=prometheus_instance.db_path,
+        run_name=run_name,
+        universes=parsed_args["universes"],
+        conditions=parsed_args["conditions"],
+        strategies=parsed_args["strategies"],
+        # --- THIS IS THE FIX: 'parent_run_id' argument is removed ---
+        prometheus_instance=prometheus_instance
+    )
+    
+    try:
+        print(f"Starting Convergence Run {run_id}. This may take a long time...")
+        await asyncio.wait_for(task, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        print(f"⌛️ Convergence Run {run_id} ('{run_name}') reached time limit of {parsed_args['time_limit']}.")
+        await _update_convergence_run_status(prometheus_instance.db_path, run_id, "Timed-Out")
+        await _generate_convergence_summary(run_id, prometheus_instance)
+    except Exception as e:
+        print(f"❌ Convergence Run {run_id} ('{run_name}') failed with an unexpected error.")
+        traceback.print_exc()
+        await _update_convergence_run_status(prometheus_instance.db_path, run_id, f"Failed: {e}")
 
 def _load_kronos_config() -> Dict[str, Any]:
     """Loads configurable parameters from the Prometheus state file."""
@@ -658,6 +1253,8 @@ async def handle_kronos_command(args: List[str], prometheus_instance: Prometheus
             elif cmd == 'help':
                 print("\n--- Kronos Commands ---")
                 print("  status <on|off>      : Toggle Prometheus autonomous features ON or OFF.")
+                print("  convergence <name> --universes=... --conditions=... --strategies=... : Run a meta-optimization R&D test.")
+                print("                         (e.g., convergence Q4_Test --universes=SPY_500 --conditions=2022_Bear --strategies=rsi --time_limit=1h)")
                 print("  optimize <strat> <t> <p>... : Run Genetic Algorithm parameter optimization for a /backtest strategy.")
                 print("                         (e.g., optimize rsi SPY 1y)")
                 print("  test <file> <t> <p> [auto|manual] : Run the full 'Hypothesize -> Generate -> Test -> Overwrite' loop.")
@@ -675,6 +1272,15 @@ async def handle_kronos_command(args: List[str], prometheus_instance: Prometheus
             elif cmd == 'status':
                 await _handle_kronos_status(parts, prometheus_instance)
                 
+            # --- NEW: Convergence Command ---
+            elif cmd == 'convergence':
+                if not prometheus_instance.is_active:
+                    print("   -> Cannot run convergence. Prometheus is INACTIVE.")
+                    continue
+                # Use shlex to handle quoted arguments if they become complex
+                # For now, simple split is fine as args are --key=value
+                await _handle_kronos_convergence(parts, prometheus_instance)
+
             elif cmd == 'optimize':
                 if not prometheus_instance.is_active:
                     print("   -> Cannot optimize. Prometheus is INACTIVE.")

@@ -35,7 +35,7 @@ def make_hashable(obj):
     return obj
 
 def load_system_prompt(file_path="system_prompt.txt") -> str:
-    default_prompt = """You are Nexus, an expert financial AI assistant. Your sole purpose is to help users by accurately and efficiently using the available tools. You must be direct, autonomous, and tool-focused.
+    default_prompt = """You are Prometheus, an expert financial AI assistant. Your sole purpose is to help users by accurately and efficiently using the available tools. You must be direct, autonomous, and tool-focused.
 
 Today's date is {current_date_for_ai_prompt}.
 
@@ -125,7 +125,7 @@ async def handle_ai_prompt(
             current_date_for_ai_prompt=datetime.now().strftime('%B %d, %Y'),
             current_date_mmddyyyy_for_ai_prompt=datetime.now().strftime('%m/%d/%Y')
         )
-        conversation_history.extend([{"role": "user", "parts": [{"text": formatted_prompt}]}, {"role": "model", "parts": [{"text": "Acknowledged. I am Nexus. Ready to execute commands."}]}])
+        conversation_history.extend([{"role": "user", "parts": [{"text": formatted_prompt}]}, {"role": "model", "parts": [{"text": "Acknowledged. I am Prometheus. Ready to execute commands."}]}])
 
     # --- FIX: Robust Context Injection Logic for Tool Chaining ---
     print(f"[AI DEBUG] Start of turn. User message: '{user_new_message}'")
@@ -189,7 +189,7 @@ async def handle_ai_prompt(
     finally:
         stop_spinner_event.set()
         await spinner_task
-    print("\n--- Nexus AI's Final Answer ---")
+    print("\n--- Prometheus AI's Final Answer ---")
     print(final_text_response or "AI processing complete.")
     print("-----------------------------\n")
 
@@ -214,7 +214,7 @@ def listen_for_voice() -> Optional[str]:
     with sr.Microphone() as source:
         r.pause_threshold = 1.0
         r.adjust_for_ambient_noise(source, duration=1)
-        print("🎤 Listening for wake word ('Nexus')...")
+        print("🎤 Listening for wake word ('Prometheus')...")
         try:
             audio = r.listen(source, timeout=10, phrase_time_limit=15)
         except sr.WaitTimeoutError:
@@ -273,8 +273,8 @@ async def handle_voice_command(
                 speak_text("Deactivating voice assistant.", tts_engine_obj)
                 break
             
-            if "nexus" in text_lower:
-                command = text_lower.split("nexus", 1)[-1].strip()
+            if "Prometheus" in text_lower:
+                command = text_lower.split("Prometheus", 1)[-1].strip()
                 if command:
                     speak_text(f"Processing: {command}", tts_engine_obj)
                     await parse_and_execute_voice_command(
