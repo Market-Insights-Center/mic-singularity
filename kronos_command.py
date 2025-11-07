@@ -16,8 +16,9 @@ from typing import List, Dict, Optional, Any
 from prometheus_core import Prometheus # Import Prometheus class
 from dateutil.relativedelta import relativedelta
 import logging
-# (No risk_command import needed)
-
+import random
+import statistics
+import requests
 # --- (Inside kronos_command.py) ---
 
 # --- Add these new imports ---
@@ -56,97 +57,111 @@ MARKET_CONDITIONS = {
     # Add more conditions as needed
 }
 
+async def _get_index_tickers(index_name: str) -> List[str]:
+    """
+    Fetches the current list of tickers for a major index from Wikipedia.
+    Supports 'sp500' and 'nasdaq100'.
+    """
+    url_map = {
+        'sp500': 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies',
+        'nasdaq100': 'https://en.wikipedia.org/wiki/Nasdaq-100'
+    }
+    url = url_map.get(index_name.lower())
+    if not url:
+        return []
+
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        # Use pandas to easily parse the first table on the page
+        df_list = pd.read_html(response.text)
+        
+        # Find the correct table and symbol column
+        for df in df_list:
+            if 'Symbol' in df.columns:
+                # S&P 500 format
+                symbols = df['Symbol'].dropna().unique().tolist()
+                return [str(s).replace('.', '-') for s in symbols]
+            elif 'Ticker' in df.columns:
+                # NASDAQ 100 format
+                symbols = df['Ticker'].dropna().unique().tolist()
+                return [str(s).replace('.', '-') for s in symbols]
+        return []
+    except Exception as e:
+        prometheus_logger.warning(f"Failed to fetch index tickers for '{index_name}': {e}")
+        return []
+
+AI_SCREENER_DEFINITIONS = {
+    "AI_TECH_GROWTH": {
+        "rep_ticker": "QQQ",
+        "params": {
+            "sector_identifiers": ["Technology"],
+            "criteria": [{"metric": "growth_score", "operator": ">", "value": 70}],
+            "top_n": 25
+        }
+    },
+    "AI_VALUE_STOCKS": {
+        "rep_ticker": "SPYV",
+        "params": {
+            "sector_identifiers": ["Market"],
+            "criteria": [{"metric": "fundamental_score", "operator": ">", "value": 80}],
+            "top_n": 25
+        }
+    },
+    "AI_STRONG_MOMENTUM": {
+        "rep_ticker": "MTUM",
+        "params": {
+            "sector_identifiers": ["Market"],
+            "criteria": [{"metric": "technical_score", "operator": ">", "value": 80}],
+            "top_n": 25
+        }
+    }
+}
+
 async def _get_universe(name: str, prometheus_instance: Prometheus) -> Dict[str, Any]:
     """
     Fetches a list of tickers for a universe and identifies its representative ticker.
-    NEW: Supports AI-fabricated screeners.
-    Returns: {"tickers": ["A", "AAPL", ...], "representative_ticker": "SPY"}
+    NOW DYNAMIC: Uses live index scraping and the real AI screener function.
     """
     print(f"   [Convergence] Loading universe: {name}...")
     name_upper = name.upper()
     
     try:
         if name_upper == "SPY_500":
-            # In a real implementation, this would call get_sp500_symbols_singularity
-            return {"tickers": ["SPY", "AAPL", "MSFT", "GOOG"], "representative_ticker": "SPY"}
+            tickers = await _get_index_tickers('sp500')
+            return {"tickers": tickers, "representative_ticker": "SPY"}
         
         elif name_upper == "QQQ_100":
-            # This would call get_specific_index_tickers
-            return {"tickers": ["QQQ", "AAPL", "MSFT", "NVDA"], "representative_ticker": "QQQ"}
+            tickers = await _get_index_tickers('nasdaq100')
+            return {"tickers": tickers, "representative_ticker": "QQQ"}
         
-        # --- START OF PHASE 3: AI SCREENERS ---
         elif name_upper.startswith("AI_"):
-            print(f"   [Convergence] Running AI-fabricated screener: {name}...")
-            screener_tickers = []
-            rep_ticker = "SPY" # Default representative
-            
-            # --- START OF FIX: Build ai_params dict ---
-            ai_params_for_screener = {}
-            ai_query = "" # This is just for the screener's internal logging
-            
-            if name_upper == "AI_TECH_GROWTH":
-                ai_query = "Find me top tech stocks with high growth"
-                rep_ticker = "QQQ"
-                # This structure matches the 'handle_dev_backtest' call in dev_command.py
-                ai_params_for_screener = {
-                    "sector_identifiers": ["Technology"],
-                    "criteria": [
-                        {"metric": "growth_score", "operator": ">", "value": 70},
-                        {"metric": "technical_score", "operator": ">", "value": 60}
-                    ],
-                    "top_n": 20
-                }
-            
-            elif name_upper == "AI_VALUE_STOCKS":
-                ai_query = "Find me undervalued stocks in any sector"
-                rep_ticker = "SPYV" # S&P 500 Value ETF
-                ai_params_for_screener = {
-                    "sector_identifiers": ["Market"], # 'Market' or 'Any'
-                    "criteria": [
-                        {"metric": "fundamental_score", "operator": ">", "value": 80},
-                        {"metric": "technical_score", "operator": ">", "value": 50}
-                    ],
-                    "top_n": 20
-                }
-                
-            elif name_upper == "AI_STRONG_MOMENTUM":
-                ai_query = "Find me stocks with strong technical momentum"
-                rep_ticker = "MTUM" # Momentum Factor ETF
-                ai_params_for_screener = {
-                    "sector_identifiers": ["Market"],
-                    "criteria": [
-                        {"metric": "fundamental_score", "operator": ">", "value": 50},
-                        {"metric": "technical_score", "operator": ">", "value": 80}
-                    ],
-                    "top_n": 20
-                }
-
-            else:
+            screener_def = AI_SCREENER_DEFINITIONS.get(name_upper)
+            if not screener_def:
                 print(f"   [Convergence] Unknown AI Screener recipe: {name}. Defaulting to SPY.")
                 return {"tickers": ["SPY"], "representative_ticker": "SPY"}
 
-            # Call screener_func (find_and_screen_stocks) with the correct arguments
-            # as seen in dev_command.py: handle_dev_backtest -> screener_func(args=[], ai_params=...)
+            print(f"   [Convergence] Running real AI screener: {name}...")
+            
+            # Call the actual screener function from Prometheus
             results = await prometheus_instance.screener_func(
-                args=[ai_query], # Pass query as args[0]
-                ai_params=ai_params_for_screener,
-                is_called_by_ai=True
+                args=[], ai_params=screener_def["params"], is_called_by_ai=True
             )
-            # --- END OF FIX ---
 
+            screener_tickers = []
             if results and results.get("status") == "success":
-                # The screener func returns a dict with a 'results' key
                 screener_tickers = [item['Ticker'] for item in results.get('results', [])]
             else:
                 print(f"   [Convergence] AI Screener failed: {results.get('message', 'Unknown error')}")
 
             if not screener_tickers:
                 print(f"   [Convergence] AI Screener '{name}' returned no tickers. Defaulting to rep_ticker.")
-                return {"tickers": [rep_ticker], "representative_ticker": rep_ticker}
+                return {"tickers": [screener_def["rep_ticker"]], "representative_ticker": screener_def["rep_ticker"]}
 
-            print(f"   [Convergence] AI Screener found {len(screener_tickers)} tickers. Using {rep_ticker} as proxy.")
-            return {"tickers": screener_tickers, "representative_ticker": rep_ticker}
-        # --- END OF PHASE 3 ---
+            print(f"   [Convergence] AI Screener found {len(screener_tickers)} tickers.")
+            return {"tickers": screener_tickers, "representative_ticker": screener_def["rep_ticker"]}
 
         else:
             print(f"   [Convergence] Unknown universe: {name}. Using as single ticker.")
@@ -156,7 +171,7 @@ async def _get_universe(name: str, prometheus_instance: Prometheus) -> Dict[str,
         print(f"❌ CRITICAL ERROR in _get_universe '{name}': {e}")
         traceback.print_exc()
         return {"tickers": [], "representative_ticker": None}
-         
+             
 def _format_trade_frequency(trades_per_day: float) -> str:
     """
     Converts a trades_per_day float into a human-readable string
@@ -1221,7 +1236,278 @@ async def _handle_kronos_cache(parts: List[str]):
                 print(f"   -> ℹ️ '{name}' cache not found, skipping.")
         print("Cache clearing complete.")
 
-# --- Main Kronos Shell ---
+def calculate_donchian_channels(data: pd.DataFrame, window: int) -> pd.DataFrame:
+    """
+    Calculates the Donchian Channels (Upper and Lower) for a given DataFrame.
+    This function is now local to Kronos to avoid import errors.
+    """
+    df = data.copy()
+    df['Upper_Channel'] = df['High'].rolling(window=window).max().shift(1)
+    df['Lower_Channel'] = df['Low'].rolling(window=window).min().shift(1)
+    return df
+
+# --- Phase 5: Workflow Discovery (GA of GAs) ---
+
+WORKFLOW_SEARCH_SPACE = {
+    "sources": [
+        {"type": "screener", "param": "AI_TECH_GROWTH", "desc": "AI Screener: Tech Growth"},
+        {"type": "screener", "param": "AI_VALUE_STOCKS", "desc": "AI Screener: Value Stocks"},
+        {"type": "screener", "param": "AI_STRONG_MOMENTUM", "desc": "AI Screener: Strong Momentum"},
+        {"type": "sector", "param": "Technology", "desc": "Sector: Technology"},
+        {"type": "sector", "param": "Healthcare", "desc": "Sector: Healthcare"},
+        {"type": "sector", "param": "Financials", "desc": "Sector: Financials"},
+    ],
+    "filters": [
+        {"type": "breakout", "param": 20, "desc": "Filter: 20-Day Breakout"},
+        {"type": "powerscore", "param": 75, "desc": "Filter: PowerScore > 75"},
+        {"type": None, "param": None, "desc": "Filter: None"},
+    ],
+    "actions": [
+        {"type": "backtest", "param": "rsi", "desc": "Action: Backtest (RSI)"},
+        {"type": "backtest", "param": "ma_crossover", "desc": "Action: Backtest (MA Crossover)"},
+        {"type": "backtest", "param": "trend_following", "desc": "Action: Backtest (Trend Following)"},
+    ]
+}
+
+def _generate_initial_workflow_population(population_size: int) -> List[Dict]:
+    """Creates an initial random population of workflow individuals."""
+    population = []
+    for _ in range(population_size):
+        individual = {
+            "source": random.choice(WORKFLOW_SEARCH_SPACE["sources"]),
+            "filter": random.choice(WORKFLOW_SEARCH_SPACE["filters"]),
+            "action": random.choice(WORKFLOW_SEARCH_SPACE["actions"]),
+        }
+        population.append(individual)
+    return population
+
+async def _filter_tickers_by_breakout(tickers: List[str], window: int, prometheus_instance: Prometheus) -> List[str]:
+    """
+    Internal helper to filter a list of tickers for those currently breaking out.
+    """
+    if not tickers:
+        return []
+    
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=window * 2)
+    
+    data = await prometheus_instance.get_yf_download_robustly(
+        tickers=tickers, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d')
+    )
+    if data.empty:
+        return []
+
+    breakout_tickers = []
+    for ticker in tickers:
+        try:
+            if ('High', ticker) not in data.columns or ('Low', ticker) not in data.columns or ('Close', ticker) not in data.columns:
+                continue
+
+            ticker_df = data.loc[:, pd.IndexSlice[:, ticker]].copy()
+            ticker_df.columns = ticker_df.columns.droplevel(1)
+            
+            if len(ticker_df.dropna()) < window + 1:
+                continue
+
+            ticker_df = calculate_donchian_channels(ticker_df, window)
+            
+            latest_close = ticker_df['Close'].iloc[-1]
+            previous_upper = ticker_df['Upper_Channel'].iloc[-1]
+
+            if pd.notna(latest_close) and pd.notna(previous_upper) and latest_close > previous_upper:
+                breakout_tickers.append(ticker)
+        except Exception:
+            continue
+            
+    return breakout_tickers
+
+async def _evaluate_workflow_fitness(workflow: Dict, condition: Dict, prometheus_instance: Prometheus) -> float:
+    """
+    Executes a full workflow and returns its fitness score (average backtest return %).
+    """
+    MAX_TICKERS_TO_EVALUATE = 5
+    
+    try:
+        source_type = workflow["source"]["type"]
+        source_param = workflow["source"]["param"]
+        initial_tickers = []
+
+        if source_type == "screener":
+            universe_data = await _get_universe(source_param, prometheus_instance)
+            initial_tickers = universe_data.get("tickers", [])
+        elif source_type == "sector":
+            universe_data = await _get_universe(source_param, prometheus_instance)
+            initial_tickers = universe_data.get("tickers", [])
+
+        if not initial_tickers: return -999.0
+
+        filter_type = workflow["filter"]["type"]
+        filtered_tickers = initial_tickers
+
+        if filter_type == "breakout":
+            filter_param = workflow["filter"]["param"]
+            filtered_tickers = await _filter_tickers_by_breakout(initial_tickers, filter_param, prometheus_instance)
+        elif filter_type == "powerscore":
+            if len(initial_tickers) > 10:
+                 filtered_tickers = random.sample(initial_tickers, 10)
+
+        if not filtered_tickers: return -998.0
+
+        action_type = workflow["action"]["type"]
+        action_param = workflow["action"]["param"]
+        
+        if action_type == "backtest":
+            tickers_to_evaluate = filtered_tickers
+            if len(filtered_tickers) > MAX_TICKERS_TO_EVALUATE:
+                tickers_to_evaluate = random.sample(filtered_tickers, MAX_TICKERS_TO_EVALUATE)
+
+            tasks = []
+            for ticker in tickers_to_evaluate:
+                task = prometheus_instance.run_parameter_optimization(
+                    command_name="/backtest", strategy_name=action_param,
+                    ticker=ticker, start_date=condition["start_date"], end_date=condition["end_date"],
+                    generations=5, population_size=10
+                )
+                tasks.append(task)
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            successful_returns = [res[1] for res in results if isinstance(res, tuple) and len(res) > 1 and isinstance(res[1], (int, float)) and res[1] > -900]
+
+            if not successful_returns: return -997.0
+
+            return statistics.mean(successful_returns)
+
+    except Exception as e:
+        prometheus_logger.warning(f"Workflow evaluation failed: {e}")
+        return -1000.0
+    
+    return -1000.0
+
+def _crossover_workflows(parents: List[Dict]) -> List[Dict]:
+    parent1, parent2 = random.sample(parents, 2)
+    child = {
+        "source": parent1["source"] if random.random() < 0.5 else parent2["source"],
+        "filter": parent1["filter"] if random.random() < 0.5 else parent2["filter"],
+        "action": parent1["action"] if random.random() < 0.5 else parent2["action"],
+    }
+    return [child]
+
+def _mutate_workflow(individual: Dict, mutation_rate: float) -> Dict:
+    mutated_individual = individual.copy()
+    if random.random() < mutation_rate:
+        mutated_individual["source"] = random.choice(WORKFLOW_SEARCH_SPACE["sources"])
+    if random.random() < mutation_rate:
+        mutated_individual["filter"] = random.choice(WORKFLOW_SEARCH_SPACE["filters"])
+    if random.random() < mutation_rate:
+        mutated_individual["action"] = random.choice(WORKFLOW_SEARCH_SPACE["actions"])
+    return mutated_individual
+
+def _format_workflow(workflow: Dict) -> str:
+    source_str = workflow['source']['desc']
+    filter_str = workflow['filter']['desc']
+    action_str = workflow['action']['desc']
+    return f"{source_str} -> {filter_str} -> {action_str}"
+
+async def _run_workflow_optimization(run_name: str, condition_name: str, generations: int, population_size: int, prometheus_instance: Prometheus):
+    """Orchestrator for the workflow discovery GA."""
+    print(f"\n--- 🚀 Starting Workflow Discovery Run: '{run_name}' ---")
+    
+    condition = MARKET_CONDITIONS.get(condition_name)
+    if not condition:
+        print(f"❌ Error: Market condition '{condition_name}' not found.")
+        return
+
+    print(f"   Market Condition: {condition_name} ({condition['start_date']} to {condition['end_date']})")
+    print(f"   Generations: {generations}, Population Size: {population_size}")
+
+    # 1. Initialize Population
+    current_population = _generate_initial_workflow_population(population_size)
+    best_workflow_overall = None
+    best_fitness_overall = -float('inf')
+
+    # 2. Run GA Loop
+    for gen in range(generations):
+        print(f"\n--- [Generation {gen + 1}/{generations}] ---")
+        print("   -> Evaluating workflow fitness...")
+
+        tasks = [_evaluate_workflow_fitness(ind, condition, prometheus_instance) for ind in current_population]
+        fitness_scores = await asyncio.gather(*tasks)
+
+        population_with_fitness = sorted(
+            zip(current_population, fitness_scores),
+            key=lambda item: item[1],
+            reverse=True
+        )
+
+        current_best_workflow, current_best_fitness = population_with_fitness[0]
+        
+        print(f"   -> Best Fitness (Avg Return %): {current_best_fitness:.2f}%")
+        print(f"      Workflow: {_format_workflow(current_best_workflow)}")
+
+        if current_best_fitness > best_fitness_overall:
+            best_fitness_overall = current_best_fitness
+            best_workflow_overall = current_best_workflow
+            print("      ✨ New Overall Best Found! ✨")
+
+        # 3. Evolve Population
+        num_parents = population_size // 2
+        parents = [ind for ind, fit in population_with_fitness[:num_parents]]
+        
+        offspring = []
+        for _ in range(population_size - num_parents):
+            offspring.extend(_crossover_workflows(parents))
+            
+        mutated_offspring = [_mutate_workflow(ind, mutation_rate=0.3) for ind in offspring]
+
+        current_population = parents + mutated_offspring
+
+    print("\n--- 🏆 Workflow Discovery Finished 🏆 ---")
+    if best_workflow_overall:
+        print(f"  Best Workflow Found: {_format_workflow(best_workflow_overall)}")
+        print(f"  Best Fitness (Avg Return %): {best_fitness_overall:.2f}%")
+        
+        # --- NEW: Display Screener Parameters ---
+        if best_workflow_overall['source']['type'] == 'screener':
+            screener_name = best_workflow_overall['source']['param']
+            screener_params = AI_SCREENER_DEFINITIONS.get(screener_name)
+            if screener_params:
+                print("\n  AI Screener Parameters:")
+                print(json.dumps(screener_params['params'], indent=2))
+        # --- END NEW ---
+
+        print("\n  JSON Definition:")
+        print(json.dumps(best_workflow_overall, indent=2))
+    else:
+        print("  No successful workflow was found.")
+        
+async def _handle_kronos_discover(parts: List[str], prometheus_instance: Prometheus):
+    if len(parts) < 2:
+        print("Usage: discover <run_name> --condition=<name> [--generations=5] [--population=10]")
+        print("  --condition: A defined market condition (e.g., 2022_Bear, Current_1Y)")
+        return
+
+    run_name = parts[1]
+    args = parts[2:]
+    
+    parsed_args = {"condition": None, "generations": 5, "population": 10}
+    for arg in args:
+        if arg.startswith("--condition="):
+            parsed_args["condition"] = arg.split('=', 1)[1]
+        elif arg.startswith("--generations="):
+            parsed_args["generations"] = int(arg.split('=', 1)[1])
+        elif arg.startswith("--population="):
+            parsed_args["population"] = int(arg.split('=', 1)[1])
+            
+    if not parsed_args["condition"]:
+        print("❌ Error: --condition is a required argument.")
+        return
+
+    await _run_workflow_optimization(
+        run_name=run_name, condition_name=parsed_args["condition"],
+        generations=parsed_args["generations"], population_size=parsed_args["population"],
+        prometheus_instance=prometheus_instance
+    )
 
 async def handle_kronos_command(args: List[str], prometheus_instance: Prometheus):
     """
@@ -1253,14 +1539,16 @@ async def handle_kronos_command(args: List[str], prometheus_instance: Prometheus
             elif cmd == 'help':
                 print("\n--- Kronos Commands ---")
                 print("  status <on|off>      : Toggle Prometheus autonomous features ON or OFF.")
-                print("  convergence <name> --universes=... --conditions=... --strategies=... : Run a meta-optimization R&D test.")
-                print("                         (e.g., convergence Q4_Test --universes=SPY_500 --conditions=2022_Bear --strategies=rsi --time_limit=1h)")
-                print("  optimize <strat> <t> <p>... : Run Genetic Algorithm parameter optimization for a /backtest strategy.")
+                print("  discover <name> --condition=... : [Phase 5] Run workflow optimization to find the best trading processes.")
+                print("                         (e.g., discover FindAlpha --condition=2022_Bear)")
+                print("  convergence <name> --universes=... : [Phase 1-4] Run meta-optimization for strategy parameters.")
+                print("                         (e.g., convergence Q4_Test --universes=SPY_500 --conditions=2022_Bear --strategies=rsi)")
+                print("  optimize <strat> <t> <p>... : Run GA parameter optimization for a single /backtest strategy.")
                 print("                         (e.g., optimize rsi SPY 1y)")
                 print("  test <file> <t> <p> [auto|manual] : Run the full 'Hypothesize -> Generate -> Test -> Overwrite' loop.")
                 print("                         (e.g., test backtest_command.py SPY 2y manual)")
                 print("  schedule <add|list|remove>... : Manage scheduled tasks.")
-                print("                         (e.g., schedule add 4h \"/briefing\" [--market-hours])")
+                print("                         (e.g., schedule add 4h \"/briefing\")")
                 print("  analyze logs <cmd|errors> : Analyze the Prometheus command log database.")
                 print("                         (e.g., analyze logs /backtest)")
                 print("  cache <list|clear>   : View or clear data caches (e.g., for /risk).")
@@ -1272,14 +1560,17 @@ async def handle_kronos_command(args: List[str], prometheus_instance: Prometheus
             elif cmd == 'status':
                 await _handle_kronos_status(parts, prometheus_instance)
                 
-            # --- NEW: Convergence Command ---
             elif cmd == 'convergence':
                 if not prometheus_instance.is_active:
                     print("   -> Cannot run convergence. Prometheus is INACTIVE.")
                     continue
-                # Use shlex to handle quoted arguments if they become complex
-                # For now, simple split is fine as args are --key=value
                 await _handle_kronos_convergence(parts, prometheus_instance)
+
+            elif cmd == 'discover':
+                if not prometheus_instance.is_active:
+                    print("   -> Cannot run discovery. Prometheus is INACTIVE.")
+                    continue
+                await _handle_kronos_discover(parts, prometheus_instance)
 
             elif cmd == 'optimize':
                 if not prometheus_instance.is_active:
@@ -1317,8 +1608,6 @@ async def handle_kronos_command(args: List[str], prometheus_instance: Prometheus
         except Exception as e:
             print(f"❌ An error occurred in the Kronos shell: {e}")
             traceback.print_exc()
-
-# --- Background Scheduler Worker (MODIFIED) ---
 
 async def kronos_scheduler_worker(prometheus_instance: Prometheus):
     """

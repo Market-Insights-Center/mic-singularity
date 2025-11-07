@@ -30,6 +30,7 @@ COMMANDS_DIR = 'Isolated Commands' # Directory for original commands
 OPTIMIZABLE_PARAMS_FILE = 'optimizable_parameters.json' # <-- NEW CONFIG FILE
 PROMETHEUS_STATE_FILE = 'prometheus_state.json'
 DEFAULT_CORR_INTERVAL_HOURS = 6
+DEFAULT_WORKFLOW_CHANCE = 0.1
 
 # --- Prometheus Core Logger ---
 prometheus_logger = logging.getLogger('PROMETHEUS_CORE')
@@ -180,33 +181,41 @@ class Prometheus:
         prometheus_logger.info("Initializing Prometheus Core...")
         self.db_path = "prometheus_kb.sqlite"; self._initialize_db()
 
-        # --- MODIFIED: Additions for status toggle ---
-        self.is_active = self._load_prometheus_state() # Load saved state
+        # --- START OF MODIFICATION ---
+        # Load state and config values first
+        self.is_active = self._load_prometheus_state()
+        self.workflow_analysis_chance = DEFAULT_WORKFLOW_CHANCE # Default value
+        try:
+            if os.path.exists(PROMETHEUS_STATE_FILE):
+                with open(PROMETHEUS_STATE_FILE, 'r') as f:
+                    state = json.load(f)
+                    # Overwrite default if the value exists in the state file
+                    self.workflow_analysis_chance = state.get("workflow_analysis_chance", DEFAULT_WORKFLOW_CHANCE)
+        except (IOError, json.JSONDecodeError) as e:
+            prometheus_logger.warning(f"Could not load workflow_analysis_chance from state file: {e}. Using default.")
+
         print(f"   -> Prometheus Core: Initializing in {'ACTIVE' if self.is_active else 'INACTIVE'} state.")
-        self.base_toolbox = toolbox_map.copy() # Store original commands
-        self.toolbox = toolbox_map # This map will be modified with synthesized commands
-        # --- END MODIFIED ---
+        self.base_toolbox = toolbox_map.copy()
+        self.toolbox = toolbox_map
+        # --- END OF MODIFICATION ---
 
         self.risk_command_func = risk_command_func; self.derivative_func = derivative_func; self.mlforecast_func = mlforecast_func
         self.screener_func = screener_func; self.powerscore_func = powerscore_func; self.sentiment_func = sentiment_func
         self.fundamentals_func = fundamentals_func; self.quickscore_func = quickscore_func
         self.gemini_model = None; self.gemini_api_key = gemini_api_key; self.synthesized_commands = set()
-        
+    
         if gemini_api_key and "AIza" in gemini_api_key:
              try:
                  genai.configure(api_key=gemini_api_key)
-                 # --- CORRECTED MODEL NAME ---
-                 self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-lite')
+                 self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
                  prometheus_logger.info("Gemini model OK."); print("   -> Prometheus Core: Gemini model initialized.")
              except Exception as e: prometheus_logger.error(f"Gemini init failed: {e}"); print(f"   -> Prometheus Core: Warn - Gemini init failed: {e}")
         else: prometheus_logger.warning("Gemini API key missing/invalid."); print("   -> Prometheus Core: Warn - Gemini API key missing/invalid.")
 
-        # self._load_and_register_synthesized_commands_sync() # <-- This line is moved
         self._load_optimizable_params()
 
-        # --- MODIFIED: Conditional loading and tasks based on self.is_active ---
-        required_funcs = [self.derivative_func, self.mlforecast_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func] # Removed powerscore temporarily
-        
+        required_funcs = [self.derivative_func, self.mlforecast_func, self.sentiment_func, self.fundamentals_func, self.quickscore_func]
+    
         if self.is_active:
             self._load_and_register_synthesized_commands_sync()
             if all(required_funcs): 
@@ -219,8 +228,7 @@ class Prometheus:
         else:
             prometheus_logger.info("Prometheus initialized in INACTIVE state. No background tasks or synthesized commands loaded.")
             self.correlation_task = None
-        # --- END MODIFIED ---
-            
+        
         os.makedirs(IMPROVED_CODE_DIR, exist_ok=True)
 
     def _load_prometheus_state(self) -> bool:
