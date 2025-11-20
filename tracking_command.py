@@ -11,17 +11,328 @@ from tabulate import tabulate
 import matplotlib.pyplot as plt
 import numpy as np
 import uuid
+import traceback
+import re
+import smtplib
+import configparser
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import math
 
 # --- Local Imports from other command modules ---
 from custom_command import _get_custom_portfolio_run_csv_filepath, _save_custom_portfolio_run_to_csv, TRACKING_ORIGIN_FILE
 from invest_command import process_custom_portfolio, calculate_ema_invest
 from custom_command import PORTFOLIO_DB_FILE
 
+try:
+    from execution_command import execute_portfolio_rebalance, get_robinhood_equity
+except ImportError:
+    def execute_portfolio_rebalance(trades): print("Execution module not found.")
+    def get_robinhood_equity(): return 0.0
+
 # --- Constants ---
 SUBPORTFOLIO_NAMES_FILE = 'portfolio_subportfolio_names.csv'
+config = configparser.ConfigParser()
+config.read('config.ini')
 
 # --- Helper Functions ---
+async def _send_tracking_email(subject: str, html_body: str, recipient_email: str):
+    """Sends an HTML email notification."""
+    try:
+        config = configparser.ConfigParser()
+        config.read('config.ini')
+        
+        smtp_server = config.get('EMAIL_CONFIG', 'SMTP_SERVER')
+        smtp_port = config.getint('EMAIL_CONFIG', 'SMTP_PORT')
+        sender_email = config.get('EMAIL_CONFIG', 'SENDER_EMAIL')
+        sender_password = config.get('EMAIL_CONFIG', 'SENDER_PASSWORD')
 
+        if not all([smtp_server, smtp_port, sender_email, sender_password, recipient_email]):
+            print("⚠️ Email config incomplete. Cannot send notification.")
+            return
+
+        msg = MIMEMultipart()
+        msg['From'], msg['To'], msg['Subject'] = sender_email, recipient_email, subject
+        
+        # --- This is the key change: send 'html' instead of 'plain' ---
+        msg.attach(MIMEText(html_body, 'html'))
+
+        def _send_email_sync():
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.starttls()
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+        
+        await asyncio.to_thread(_send_email_sync)
+        
+    except Exception as e:
+        print(f"❌ Failed to send tracking email: {e}")
+        # We'll print the error but not stop the main command
+
+async def send_notification(subject: str, body: str, recipient_email_override: Optional[str] = None):
+    """Sends an email notification."""
+    try:
+        smtp_server = config.get('EMAIL_CONFIG', 'SMTP_SERVER')
+        smtp_port = config.getint('EMAIL_CONFIG', 'SMTP_PORT')
+        sender_email = config.get('EMAIL_CONFIG', 'SENDER_EMAIL')
+        sender_password = config.get('EMAIL_CONFIG', 'SENDER_PASSWORD')
+        recipient = recipient_email_override or config.get('EMAIL_CONFIG', 'RECIPIENT_EMAIL', fallback=None)
+
+        if not all([smtp_server, smtp_port, sender_email, sender_password, recipient]):
+            print("⚠️ Email config incomplete. Cannot send notification.")
+            return
+
+        msg = MIMEMultipart()
+        msg['From'], msg['To'], msg['Subject'] = sender_email, recipient, subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Define the synchronous function to be run in a thread
+        def _send_email_sync():
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.starttls()  # Secure the connection
+                server.login(sender_email, sender_password) # Login
+                server.send_message(msg) # Send the email
+        
+        # Run the blocking email code in a separate thread
+        await asyncio.to_thread(_send_email_sync)
+        print(f"✔ Email notification sent successfully to {recipient}.")
+    except Exception as e:
+        print(f"❌ Failed to send email notification: {e}")
+   
+async def _ask_and_send_trade_email(
+    portfolio_code: str, 
+    trade_recs: List[Dict[str, Any]], 
+    new_run_data: List[Dict[str, Any]], 
+    new_cash: float, 
+    new_total_value: float
+):
+    """
+    Asks the user if they want an email with trade recommendations and a full
+    portfolio table, then sends it as an HTML email.
+    (Version 4: Forced white text color and alphabetical table sorting)
+    """
+    print("\n--- 📧 Trade Recommendation Email ---")
+    try:
+        # 1. Ask the user if they want an email
+        send_email = input("Would you like to receive an email with these trade recommendations? (yes/no): ").lower().strip()
+        if send_email != 'yes':
+            print("-> Email not sent.")
+            return
+
+        # 2. Get and validate the recipient email address
+        email_regex = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+        recipient_email = ""
+        while True:
+            recipient_email = input("Enter your email address: ").strip()
+            if re.match(email_regex, recipient_email):
+                break
+            print("Invalid email format. Please try again.")
+
+        print(f"-> Preparing HTML email for {recipient_email}...")
+        
+        info_blocks_html = ""
+        # 3. Build the "Info Blocks" for the email body (as pre-formatted text)
+        if trade_recs:
+            info_blocks_html += "<h2>Trade Recommendations (Changes)</h2>"
+            # Info block text remains dark gold
+            info_blocks_html += "<pre style='font-family: monospace; background-color: #2c2f33; color: #DAA520; padding: 10px; border-radius: 5px;'>"
+            
+            for rec in trade_recs:
+                ticker = rec['ticker']
+                share_change = rec['share_change']
+                live_price = rec['live_price']
+                
+                action = "BUY" if share_change > 0 else "SELL"
+                shares = abs(share_change)
+                estimated_value = abs(share_change * live_price)
+                power_direction = "Used" if action == "BUY" else "Returned"
+                robinhood_link = f"https://robinhood.com/stocks/{ticker}"
+
+                block = (
+                    "---------------------------------------------\n"
+                    "--- TRADE RECOMMENDATION (Info Block) ---\n"
+                    f"Action:     {action}\n"
+                    f"Ticker:     {ticker}\n"
+                    f"Order Type: Market\n"
+                    f"Amount:     {shares:.2f} Shares\n"
+                    f"Est. Power {power_direction}: ${estimated_value:,.2f}\n\n"
+                    f"Trade Link: {robinhood_link}\n"
+                    "---------------------------------------------\n"
+                )
+                info_blocks_html += block
+            info_blocks_html += "</pre>"
+        else:
+            info_blocks_html = "<h2>No Trade Changes Recommended</h2><p>Your portfolio allocation is already aligned with the new recommendation.</p>"
+
+        # 4. Build the new "Full Portfolio" HTML table
+        full_table_html = "<h2>Full Recommended Portfolio</h2>"
+        full_table_html += """
+        <style>
+            table.mic-table {
+                border-collapse: collapse;
+                width: 100%;
+                font-family: Arial, sans-serif;
+                /* --- CSS MODIFICATION: Table body text is white --- */
+                color: #f0f0f0 !important; 
+                border: 1px solid #555;
+            }
+            table.mic-table th, table.mic-table td {
+                border: 1px solid #555;
+                padding: 8px 12px;
+                text-align: left;
+                /* --- CSS MODIFICATION: Explicitly set cell text color --- */
+                color: #f0f0f0 !important;
+            }
+            table.mic-table th {
+                background-color: #9400D3; /* Violet Purple */
+                color: #ffffff !important;
+                text-align: center;
+            }
+            table.mic-table tr:nth-child(even) {
+                background-color: #3e4147;
+            }
+            table.mic-table td:nth-child(n+3) { /* Right-align numeric columns */
+                text-align: right;
+            }
+            table.mic-table a {
+                color: #00A36C; /* Green link */
+                font-weight: bold;
+                text-decoration: none;
+            }
+            table.mic-table a:hover {
+                text-decoration: underline;
+            }
+        </style>
+        <table class='mic-table'>
+            <thead>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Sub-Portfolio Path</th>
+                    <th>Shares</th>
+                    <th>$ Value</th>
+                    <th>% of Total</th>
+                    <th>Trade Link</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        
+        # --- LOGIC MODIFICATION: Sort by ticker alphabetically ---
+        sorted_new_run = sorted(new_run_data, key=lambda x: x.get('ticker', ''))
+
+        for item in sorted_new_run:
+            ticker = item.get('ticker', 'N/A')
+            shares = float(item.get('shares', 0))
+            value = float(item.get('actual_money_allocation', 0))
+            percent = (value / new_total_value) * 100 if new_total_value > 0 else 0
+            path = item.get('SubPortfolioPath', 'N/A')
+            
+            robinhood_link = f"https://robinhood.com/stocks/{ticker}"
+            link_html = f"<a href='{robinhood_link}'>Trade</a>"
+            
+            full_table_html += (
+                f"<tr>"
+                f"<td>{ticker}</td>"
+                f"<td>{path}</td>"
+                f"<td>{shares:.2f}</td>"
+                f"<td>${value:,.2f}</td>"
+                f"<td>{percent:.2f}%</td>"
+                f"<td>{link_html}</td>"
+                f"</tr>"
+            )
+
+        # Add the Cash row
+        cash_percent = (new_cash / new_total_value) * 100 if new_total_value > 0 else 0
+        full_table_html += (
+            f"<tr style='font-weight: bold; background-color: #1e1f22;'>"
+            f"<td>Cash</td>"
+            f"<td>Cash</td>"
+            f"<td>${new_cash:,.2f}</td>"
+            f"<td>${new_cash:,.2f}</td>"
+            f"<td>{cash_percent:.2f}%</td>"
+            f"<td>-</td>"
+            f"</tr>"
+        )
+        full_table_html += "</tbody></table>"
+
+        # 5. Assemble the final email
+        email_body = f"""
+        <html>
+            <head>
+                <style>
+                    body {{
+                        font-family: Arial, sans-serif;
+                        line-height: 1.6;
+                        background-color: #1e1f22;
+                        /* --- CSS MODIFICATION: Main body text is white --- */
+                        color: #f0f0f0 !important; 
+                        margin: 0;
+                        padding: 20px;
+                    }}
+                    .container {{
+                        width: 90%;
+                        max-width: 900px;
+                        margin: auto;
+                        background: #2c2f33;
+                        padding: 30px;
+                        border-radius: 8px;
+                        /* --- CSS MODIFICATION: Explicitly set container text color --- */
+                        color: #f0f0f0 !important;
+                    }}
+                    h1 {{ 
+                        color: #9400D3; /* Violet Purple */
+                    }} 
+                    h2 {{ 
+                        border-bottom: 2px solid #9400D3; /* Violet Purple */
+                        padding-bottom: 5px; 
+                        color: #9400D3; /* Violet Purple */
+                    }}
+                    /* --- CSS MODIFICATION: Explicitly set p tag color --- */
+                    p {{ 
+                        font-size: 16px; 
+                        color: #f0f0f0 !important;
+                    }}
+                    .disclaimer {{
+                        font-size: 12px;
+                        color: #B8860B; /* Dark Gold */
+                        margin-top: 30px;
+                        border-top: 1px solid #555;
+                        padding-top: 15px;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class='container'>
+                    <h1>M.I.C. Singularity - Trade Recommendations</h1>
+                    <p>Hello,</p>
+                    <p>Here are the trade recommendations and the full new portfolio allocation for <strong>'{portfolio_code}'</strong> based on your recent /tracking run for a total value of <strong>${new_total_value:,.2f}</strong>.</p>
+                    
+                    {info_blocks_html}
+                    
+                    <br><br>
+                    
+                    {full_table_html}
+
+                    <p class='disclaimer'>
+                        Disclaimer: These are algorithmically generated suggestions, not financial advice. 
+                        Always verify information before executing any trade.
+                    </p>
+                </div>
+            </body>
+        </html>
+        """
+        
+        subject = f"M.I.C. Singularity - Trade Recommendations for {portfolio_code}"
+        
+        # 6. Call the local email function
+        await _send_tracking_email(subject, email_body, recipient_email)
+        
+        print(f"✅ Successfully sent HTML trade recommendations to {recipient_email}.")
+    
+    except Exception as e:
+        print(f"❌ Error sending trade email: {e}")
+        traceback.print_exc()
+        
 async def load_portfolio_config(portfolio_code: str) -> Optional[Dict[str, Any]]:
     """Robustly loads a specific portfolio's configuration from the database CSV."""
     try:
@@ -468,53 +779,59 @@ async def handle_comparison_subcommand():
 
 # --- Main Handler for /tracking ---
 # <<< START: REPLACEMENT FOR handle_tracking_command >>>
+# <<< REPLACEMENT FOR handle_tracking_command >>>
 async def handle_tracking_command(args: List[str]):
-    """Handles the /tracking command to analyze a custom portfolio's performance and changes."""
+    """Handles the /tracking command with automated RH fetching and optimized workflow."""
     print("\n--- /tracking Command ---")
     if not args:
-        # Updated usage instructions
         print("Usage: /tracking <portfolio_code | comparison> [name]")
-        print("  - <portfolio_code>: Run a full performance review for a specific portfolio.")
-        print("  - 'comparison': Compare the holdings of two saved portfolios.")
-        print("  - [name]: Use with a <portfolio_code> to manage sub-portfolio names.")
         return
 
-    # Check for the new 'comparison' subcommand at the start
     if args[0].lower() == 'comparison':
         await handle_comparison_subcommand()
         return
 
-    # The rest of the function handles the original logic
     portfolio_code = args[0]
     subcommand = args[1].lower() if len(args) > 1 else None
-
-    all_names_map = _load_all_subportfolio_names() # Load all names globally
-
+    all_names_map = _load_all_subportfolio_names()
+    
+    # --- 1. Load Config & Data ---
     portfolio_config = await load_portfolio_config(portfolio_code)
     if not portfolio_config:
         return
 
     if subcommand == 'name':
-        # Pass the global map to be updated
         await manage_subportfolio_names(portfolio_code, portfolio_config, all_names_map, force_rename=True)
         return
 
     old_run_data = await _load_portfolio_run(portfolio_code)
+
+    # --- 2. Auto-Fetch Robinhood Equity ---
+    print("⏳ Connecting to Robinhood to fetch current portfolio value...")
+    # Run in thread to avoid blocking
+    rh_equity = await asyncio.to_thread(get_robinhood_equity)
     
+    suggested_value = None
+    if rh_equity > 0:
+        # 99% of value, rounded down to nearest dollar
+        suggested_value = math.floor(rh_equity * 0.99)
+        print(f"✔ Robinhood Portfolio Value Fetched: ${rh_equity:,.2f}")
+        print(f"  -> Suggested Tailoring Value (99%): ${suggested_value:,.2f}")
+    else:
+        print("⚠️ Could not fetch Robinhood value (or login failed). Proceeding with manual input.")
+
+    # --- 3. Performance Since Last Save ---
+    # Handle retroactive naming if needed
     if old_run_data and any(not row.get('SubPortfolio') or row.get('SubPortfolio') == 'Unassigned' for row in old_run_data):
-        print("Info: Older save file detected. Retroactively assigning tickers to sub-portfolios from definition...")
         ticker_to_sub_map = _get_subportfolio_map_from_config(portfolio_config)
         for row in old_run_data:
             if not row.get('SubPortfolio') or row.get('SubPortfolio') == 'Unassigned':
                 row['SubPortfolio'] = ticker_to_sub_map.get(row['Ticker'], 'Unassigned')
 
-    # Pass the global map to be checked and potentially updated
     await manage_subportfolio_names(portfolio_code, portfolio_config, all_names_map, force_rename=False)
 
     if old_run_data:
         print("\n--- Performance Since Last Save ---")
-        
-        # 1. Fetch live prices for all tickers in the old run
         tickers_to_fetch = [row['Ticker'] for row in old_run_data if row.get('Ticker') != 'Cash']
         tasks = [calculate_ema_invest(ticker, ema_interval=2, is_called_by_ai=True) for ticker in tickers_to_fetch]
         live_price_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -523,52 +840,42 @@ async def handle_tracking_command(args: List[str]):
             for ticker, res in zip(tickers_to_fetch, live_price_results)
             if not isinstance(res, Exception) and res and res[0] is not None
         }
-
-        # 2. Build the nested performance data structure
         nested_performance_data = _build_nested_performance_dict(old_run_data, live_prices)
-
-        # 3. Display the data recursively
         if nested_performance_data:
             _display_performance_recursively(nested_performance_data)
-        
-            # Calculate and display the final portfolio-wide summary
-            total_initial_value_all = sum(node['initial_value'] for node in nested_performance_data.values())
-            total_current_value_all = sum(node['current_value'] for node in nested_performance_data.values())
-            portfolio_total_pnl = total_current_value_all - total_initial_value_all
-            portfolio_total_pnl_pct = (portfolio_total_pnl / total_initial_value_all) * 100 if total_initial_value_all > 0 else 0
-            
-            print("\n" + "="*60)
-            print(f"** Entire Portfolio Summary Since Last Save **")
-            print(f"  Initial Value: ${total_initial_value_all:,.2f}")
-            print(f"  Current Value: ${total_current_value_all:,.2f}")
-            print(f"  Total P&L: ${portfolio_total_pnl:,.2f} ({portfolio_total_pnl_pct:.2f}%)")
-            print("="*60)
-        else:
-            print("Could not calculate performance data.")
-    else:
-        print("This appears to be the first run for this portfolio, or the last run was not tailored.")
 
+    # --- 4. Inputs for New Calculation ---
     print("\n--- Generating New Portfolio Recommendation ---")
-    val_input = input("Enter total portfolio value for new recommendation (e.g., 10000): ").strip()
-    try:
-        new_total_value = float(val_input)
-        if new_total_value <= 0:
-            print("Value must be positive. Aborting.")
-            return
-    except ValueError:
-        print("Invalid value. Aborting.")
-        return
-
+    
+    # Fractional Shares Input
     frac_shares_config = portfolio_config.get('frac_shares', 'false').lower() == 'true'
-    print(f"(Configuration default for fractional shares is: {frac_shares_config})")
-    frac_input = input("Use fractional shares for new recommendation? (yes/no, default is config): ").lower().strip()
+    frac_prompt = f"Use fractional shares? (yes/no, config default: {frac_shares_config}): "
+    frac_input = input(frac_prompt).lower().strip()
     
     use_frac_shares_new = frac_shares_config
-    if frac_input == 'yes':
-        use_frac_shares_new = True
-    elif frac_input == 'no':
-        use_frac_shares_new = False
+    if frac_input == 'yes': use_frac_shares_new = True
+    elif frac_input == 'no': use_frac_shares_new = False
 
+    # Portfolio Value Input (with Auto-Fill)
+    val_prompt = "Enter total portfolio value"
+    if suggested_value:
+        val_prompt += f" (default: {suggested_value})"
+    val_prompt += ": "
+    
+    val_input = input(val_prompt).strip()
+    
+    new_total_value = 0.0
+    if not val_input and suggested_value:
+        new_total_value = float(suggested_value)
+    else:
+        try:
+            new_total_value = float(val_input)
+            if new_total_value <= 0: raise ValueError
+        except ValueError:
+            print("Invalid value. Aborting.")
+            return
+
+    # --- 5. Calculate New Allocation ---
     _, _, new_cash, new_run_data = await process_custom_portfolio(
         portfolio_data_config=portfolio_config,
         tailor_portfolio_requested=True,
@@ -579,7 +886,11 @@ async def handle_tracking_command(args: List[str]):
         names_map=all_names_map
     )
 
+    # --- 6. Display Analysis ---
     await display_all_time_performance(portfolio_code, new_run_data, old_run_data, portfolio_config, all_names_map)
+
+    trades_to_execute = [] 
+    comparison_table_str = ""
 
     if old_run_data:
         print("\n--- Comparison of Holdings (Old vs. New) ---")
@@ -600,25 +911,67 @@ async def handle_tracking_command(args: List[str]):
                 
             if status:
                 comparison_table.append([ticker, f"{old_s:.2f}", f"{new_s:.2f}", f"{change:+.2f}", status])
+                if change > 0:
+                    trades_to_execute.append({'ticker': ticker, 'side': 'buy', 'quantity': abs(change)})
+                elif change < 0:
+                    trades_to_execute.append({'ticker': ticker, 'side': 'sell', 'quantity': abs(change)})
         
         if comparison_table:
-            print(tabulate(comparison_table, headers=["Ticker", "Old Shares", "New Shares", "Change", "Status"], tablefmt="pretty"))
+            comparison_table_str = tabulate(comparison_table, headers=["Ticker", "Old Shares", "New Shares", "Change", "Status"], tablefmt="pretty")
+            print(comparison_table_str)
         else:
             print("No changes in holdings between the last run and the new recommendation.")
             
         generate_allocation_comparison_chart(old_run_data, new_run_data, portfolio_code)
 
-    overwrite_input = input("\nOverwrite last saved run with these new results? (yes/no): ").lower().strip()
-    if overwrite_input == 'yes':
-        await _save_custom_portfolio_run_to_csv(
-            portfolio_code=portfolio_code,
-            tailored_stock_holdings=new_run_data,
-            final_cash=new_cash,
-            total_portfolio_value_for_percent_calc=new_total_value
-        )
-        print(f"✔ New run for portfolio '{portfolio_code}' has been saved.")
-    else:
-        print("Last saved run was not changed.")
+    # --- 7. Email Notification ---
+    print("\n--- 📧 Trade Recommendation Email ---")
+    email_choice = input("Would you like to receive an email with these trade recommendations? (yes/no): ").lower().strip()
+    if email_choice == 'yes':
+        email_subject = f"Tracking Update: {portfolio_code} Trade Recommendations"
+        email_body = (f"Tracking Analysis for Portfolio: {portfolio_code}\n"
+                      f"Total Value Used: ${new_total_value:,.2f}\n\n"
+                      f"--- Recommended Trades ---\n"
+                      f"{comparison_table_str if comparison_table_str else 'No trades recommended.'}\n\n"
+                      f"End of Report.")
+        await send_notification(email_subject, email_body)
+
+    # --- 8. Execution & Saving Logic ---
+    executed = False
+    if trades_to_execute:
+        print(f"\n🚀 Detected {len(trades_to_execute)} potential rebalancing trades.")
+        exec_input = input(">>> Execute these trades on Robinhood? (yes/no): ").lower().strip()
+        
+        if exec_input == 'yes':
+            # Run execution
+            await asyncio.to_thread(execute_portfolio_rebalance, trades_to_execute)
+            
+            # AUTOMATIC SAVE on execution
+            print("\n💾 Trades executed. Automatically overwriting last saved run data...")
+            await _save_custom_portfolio_run_to_csv(
+                portfolio_code=portfolio_code,
+                tailored_stock_holdings=new_run_data,
+                final_cash=new_cash,
+                total_portfolio_value_for_percent_calc=new_total_value
+            )
+            print(f"✔ Run saved successfully.")
+            executed = True
+        else:
+            print("Trade execution skipped.")
+
+    # If we didn't execute (and thus didn't auto-save), ask to save manually
+    if not executed:
+        overwrite_input = input("\nOverwrite last saved run with these new results? (yes/no): ").lower().strip()
+        if overwrite_input == 'yes':
+            await _save_custom_portfolio_run_to_csv(
+                portfolio_code=portfolio_code,
+                tailored_stock_holdings=new_run_data,
+                final_cash=new_cash,
+                total_portfolio_value_for_percent_calc=new_total_value
+            )
+            print(f"✔ New run for portfolio '{portfolio_code}' has been saved.")
+        else:
+            print("Last saved run was not changed.")
         
     print("\n/tracking analysis complete.")
 # <<< END: REPLACEMENT FOR handle_tracking_command >>>

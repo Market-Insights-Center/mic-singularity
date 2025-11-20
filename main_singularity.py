@@ -115,7 +115,7 @@ from simulation_command import handle_simulation_command # type: ignore
 from mlforecast_command import handle_mlforecast_command # type: ignore
 from history_command import handle_history_command # type: ignore
 from web_command import handle_web_command # type: ignore
-from monitor_command import handle_monitor_command, load_alerts_from_csv, alert_worker # type: ignore
+from monitor_command import handle_monitor_command, load_alerts_from_csv, alert_worker, persistent_alert_worker # type: ignore
 from tracking_command import handle_tracking_command # type: ignore
 from fairvalue_command import handle_fairvalue_command # type: ignore
 from derivative_command import handle_derivative_command # type: ignore
@@ -461,6 +461,7 @@ async def main_singularity():
     display_welcome_message(command_states)
     display_utility_commands_only()
     alert_task = asyncio.create_task(alert_worker())
+    persistent_alert_task = asyncio.create_task(persistent_alert_worker())
     kronos_task = asyncio.create_task(kronos_scheduler_worker(prometheus))
 
     func_to_command_map = {func.__name__: f"/{cmd_name}" for cmd_name, func in TOOLBOX_MAP.items()} # Use full command path
@@ -633,17 +634,22 @@ async def main_singularity():
     print("Shutting down background tasks...")
     if not alert_task.done():
         alert_task.cancel()
-    if 'kronos_task' in locals() and not kronos_task.done(): # <<< ADD THIS
-        kronos_task.cancel()                               # <<< ADD THIS
+    if 'kronos_task' in locals() and not kronos_task.done(): # <<< This line is from your file
+        kronos_task.cancel()                               # <<< This line is from your file
+    if 'persistent_alert_task' in locals() and not persistent_alert_task.done(): # <<< ADD THIS
+        persistent_alert_task.cancel()                                           # <<< ADD THIS
     if prometheus.correlation_task and not prometheus.correlation_task.done():
          prometheus.correlation_task.cancel()
 
     await asyncio.sleep(0.5)
     try: await alert_task
     except asyncio.CancelledError: print("Alert worker successfully shut down.")
-    try:                                                        # <<< ADD THIS
-        if 'kronos_task' in locals(): await kronos_task         # <<< ADD THIS
-    except asyncio.CancelledError: print("Kronos scheduler successfully shut down.") # <<< ADD THIS
+    try:                                                        # <<< This line is from your file
+        if 'kronos_task' in locals(): await kronos_task         # <<< This line is from your file
+    except asyncio.CancelledError: print("Kronos scheduler successfully shut down.") # <<< This line is from your file
+    try: # <<< ADD THIS BLOCK
+        if 'persistent_alert_task' in locals(): await persistent_alert_task
+    except asyncio.CancelledError: print("Persistent alert worker successfully shut down.") # <<< ADD THIS
     try:
          if prometheus.correlation_task: await prometheus.correlation_task
     except asyncio.CancelledError: print("Prometheus background task successfully shut down.")
