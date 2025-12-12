@@ -66,6 +66,9 @@ import string
 from contextlib import contextmanager
 import io
 
+# For Web: cd "C:\Users\victo\Downloads\MIC CODE FILES\portfolio-lab"
+# >> npm run dev
+
 # --- Prometheus Core Import ---
 from prometheus_core import Prometheus # Import the new class
 from kronos_command import handle_kronos_command, kronos_scheduler_worker # <<< ADD THIS LINE
@@ -119,6 +122,7 @@ from monitor_command import handle_monitor_command, load_alerts_from_csv, alert_
 from tracking_command import handle_tracking_command # type: ignore
 from fairvalue_command import handle_fairvalue_command # type: ignore
 from derivative_command import handle_derivative_command # type: ignore
+from nexus_command import handle_nexus_command # type: ignore
 # prometheus_core import is already done above
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -416,7 +420,8 @@ TOOLBOX_MAP: Dict[str, Callable] = {
     "memo": handle_memo_command,
     "strategy_recipe": handle_strategy_recipe_command,
     "propose_improvement": handle_propose_improvement_command, # <<< Added improvement proposal handler
-    "kronos": handle_kronos_command # <<< ADD THIS LINE
+    "kronos": handle_kronos_command, # <<< ADD THIS LINE,
+    "nexus": handle_nexus_command # <<< ADD THIS LINE
 }
 
 # --- Core Application Logic ---

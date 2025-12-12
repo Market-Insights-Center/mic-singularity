@@ -17,7 +17,7 @@ MASTER_COMMAND_LIST = [
     "custom", "quickscore", "breakout", "market", "cultivate", 
     "assess A", "assess B", "assess C", "assess D", "assess E",
     "simulation", "backtest", "macdforecast", "mlforecast", "ai", "voice", "dev",
-    "tracking", "fairvalue", "derivative", "prometheus", "kronos"
+    "tracking", "fairvalue", "derivative", "prometheus", "kronos", "nexus"
 ]
 
 def load_command_states():
@@ -505,7 +505,7 @@ def display_commands():
         command_lines.append("  CLI Usage:")
         command_lines.append("    /history                        (Generates and saves all R.I.S.K. history graphs)")
 
-    invest_cmds = ["invest", "custom", "tracking", "quickscore", "breakout", "market", "cultivate", "fairvalue", "assess A", "assess B", "assess C", "assess D", "assess E"]
+    invest_cmds = ["invest", "custom", "tracking", "quickscore", "breakout", "market", "cultivate", "fairvalue", "assess A", "assess B", "assess C", "assess D", "assess E", "nexus"]
     if any(is_enabled(c) for c in invest_cmds):
         command_lines.append("\nINVEST Commands")
         command_lines.append("-------------------")
@@ -535,6 +535,13 @@ def display_commands():
         command_lines.append("               generates a new recommendation, and provides a detailed comparison of changes.")
         command_lines.append("  CLI Usage:")
         command_lines.append("    /tracking MYPORTFOLIO           (Starts the tracking and comparison process for 'MYPORTFOLIO')")
+    if is_enabled("nexus"):
+        command_lines.append("\n/nexus - Manage meta-portfolios combining standard portfolios and dynamic commands.")
+        command_lines.append("  Description: Creates and tracks 'Nexus' portfolios which are composed of other Portfolio Codes")
+        command_lines.append("               or dynamic output from commands like Market, Breakout, and Cultivate.")
+        command_lines.append("               Features full tracking, email notifications, and Robinhood execution.")
+        command_lines.append("  CLI Usage:")
+        command_lines.append("    /nexus NEXUS_CODE               (Runs or creates the Nexus portfolio)")
     if is_enabled("quickscore"):
         command_lines.append("\n/quickscore - Get quick scores and graphs for a single ticker.")
         command_lines.append("  Description: Provides EMA-based investment scores (Weekly, Daily, Hourly) and generates price/EMA graphs for one stock.")
